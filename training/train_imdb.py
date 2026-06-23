@@ -27,7 +27,16 @@ from models import SLON
 
 from utils.run_dirs import make_run_dir, sweep_summary_path, epoch_dir, save_training_checkpoint
 from utils.slon_analysis import extract_model_parameters, compute_parameter_statistics
-from utils.plotting_utils import plot_classification_epoch, create_classification_gifs
+from utils.plotting_utils import (
+    plot_classification_epoch,
+    create_classification_gifs,
+    plot_signal_stages_for_example,
+    plot_imdb_sentiment_comparison,
+    plot_imdb_sentiment_encoding_analysis,
+    find_class_examples,
+    find_class_examples_batch,
+    prepare_imdb_sequence,
+)
 from utils.manifold_dimension_analysis import analyze_manifold_dimension, collect_and_save_final_states
 
 
@@ -74,6 +83,8 @@ parser.add_argument('--cache-dir', type=str, default=os.path.join(DATA_DIR, 'imd
 parser.add_argument('--force-reprocess', action='store_true', help='force reprocessing even if cached data exists')
 parser.add_argument('--analyze-manifold', action='store_true', default=True,
                     help='Enable manifold dimension analysis (runs at end of training and every 10 epochs)')
+parser.add_argument('--sentiment-analysis-examples', type=int, default=30,
+                    help='number of positive/negative test reviews for sentiment encoding analysis')
 
 def tokenize(text):
     text = text.lower()
@@ -630,6 +641,22 @@ if __name__ == '__main__':
             param_str += f', gamma_real={gamma_real_value:.6f}'
         if gamma_imag_value is not None:
             param_str += f', gamma_imag={gamma_imag_value:.6f}'
+
+        example_token_ids, example_label = next(iter(test_loader))
+        example_token_ids = example_token_ids[0:1]
+        example_label = int(example_label[0].item())
+
+        sentiment_examples = find_class_examples(test_loader, labels=(0, 1))
+        neg_example_token_ids = sentiment_examples[0]
+        pos_example_token_ids = sentiment_examples[1]
+
+        sentiment_batch = find_class_examples_batch(
+            test_loader,
+            labels=(0, 1),
+            num_per_class=args.sentiment_analysis_examples,
+        )
+        neg_batch_token_ids = sentiment_batch[0]
+        pos_batch_token_ids = sentiment_batch[1]
         
         for epoch in tqdm(range(args.epochs), total = args.epochs):
             tqdm.write(f'epoch {epoch} ({param_str})')
@@ -760,6 +787,65 @@ if __name__ == '__main__':
                     fh_log.flush()
             except Exception as e:
                 tqdm.write(f"Warning: Failed to generate plots at epoch {epoch}: {e}")
+
+            try:
+                with torch.no_grad():
+                    example_inputs = prepare_imdb_sequence(model, example_token_ids)
+                plot_signal_stages_for_example(
+                    model,
+                    example_inputs,
+                    ep_dir,
+                    epoch,
+                    input_mode="norm",
+                    task_type="classification",
+                    class_labels=["Negative", "Positive"],
+                    true_label=example_label,
+                    num_units_plot=args.num_hidden,
+                    raw_input_label="embedding norm",
+                    title_suffix=f"example label: {'Positive' if example_label == 1 else 'Negative'}",
+                )
+            except Exception as e:
+                tqdm.write(f"Warning: Failed to generate signal stage plots at epoch {epoch}: {e}")
+
+            try:
+                summary = plot_imdb_sentiment_comparison(
+                    model,
+                    neg_example_token_ids,
+                    pos_example_token_ids,
+                    ep_dir,
+                    epoch,
+                    num_units_plot=args.num_hidden,
+                    class_labels=["Negative", "Positive"],
+                )
+                fh_log.write(
+                    f"Sentiment comparison epoch {epoch}: "
+                    f"neg_pred={summary['negative_predicted_class']}, "
+                    f"pos_pred={summary['positive_predicted_class']}, "
+                    f"final_z_diff={summary['final_mean_z_real_diff']:.4f}\n"
+                )
+                fh_log.flush()
+            except Exception as e:
+                tqdm.write(f"Warning: Failed to generate sentiment comparison plots at epoch {epoch}: {e}")
+
+            try:
+                encoding_summary = plot_imdb_sentiment_encoding_analysis(
+                    model,
+                    neg_batch_token_ids,
+                    pos_batch_token_ids,
+                    ep_dir,
+                    epoch,
+                    num_units_plot=args.num_hidden,
+                )
+                fh_log.write(
+                    f"Sentiment encoding epoch {epoch}: "
+                    f"dominant={encoding_summary['dominant_encoding']}, "
+                    f"magnitude_score={encoding_summary['magnitude_separation_score']:.3f}, "
+                    f"frequency_score={encoding_summary['frequency_separation_score']:.3f}, "
+                    f"top_feature={encoding_summary['top_separating_features'][0]['feature']}\n"
+                )
+                fh_log.flush()
+            except Exception as e:
+                tqdm.write(f"Warning: Failed to generate sentiment encoding analysis at epoch {epoch}: {e}")
 
             metrics_file = f"{output_dir}/metrics.json"
             metrics_data = {

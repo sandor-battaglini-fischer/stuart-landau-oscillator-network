@@ -196,6 +196,7 @@ def save_csv(results_path: Path, results: dict) -> None:
             row = {
                 "task": task_key,
                 "omega": entry.get("omega"),
+                "seed": entry.get("seed"),
                 "metric": entry.get("metric"),
                 "status": entry.get("status"),
                 "output_dir": entry.get("output_dir"),
@@ -219,28 +220,83 @@ def save_csv(results_path: Path, results: dict) -> None:
         writer.writerows(rows)
 
 
-def existing_omegas(results: dict, task_key: str) -> set[float]:
+def aggregate_task_results(entries: list[dict]) -> list[dict]:
+    by_omega: dict[float, list[float]] = {}
+    for entry in entries:
+        if entry.get("status") != "ok" or entry.get("metric") is None:
+            continue
+        omega = round(float(entry["omega"]), 10)
+        by_omega.setdefault(omega, []).append(float(entry["metric"]))
+
+    summary = []
+    for omega in sorted(by_omega):
+        metrics = np.asarray(by_omega[omega], dtype=float)
+        n = len(metrics)
+        mean = float(np.mean(metrics))
+        std = float(np.std(metrics, ddof=1)) if n > 1 else 0.0
+        sem = std / np.sqrt(n) if n > 1 else 0.0
+        ci95 = 1.96 * sem
+        summary.append(
+            {
+                "omega": omega,
+                "n_runs": n,
+                "mean": mean,
+                "std": std,
+                "sem": sem,
+                "ci95": ci95,
+                "min": float(np.min(metrics)),
+                "max": float(np.max(metrics)),
+            }
+        )
+    return summary
+
+
+def save_summary(results_path: Path, results: dict) -> None:
+    summary = {
+        task_key: aggregate_task_results(results.get(task_key, []))
+        for task_key in TASKS
+    }
+    summary_path = results_path.with_name("summary.json")
+    with summary_path.open("w") as f:
+        json.dump(summary, f, indent=2)
+
+
+def existing_completions(results: dict, task_key: str) -> set[tuple[float, int]]:
     return {
-        round(float(entry["omega"]), 10)
+        (round(float(entry["omega"]), 10), int(entry.get("seed", 1)))
         for entry in results.get(task_key, [])
         if entry.get("status") == "ok"
     }
 
 
+def cmd_with_overrides(base_cmd: list[str], seed: int, omega: float) -> list[str]:
+    cmd: list[str] = []
+    i = 0
+    while i < len(base_cmd):
+        if base_cmd[i] in {"--seed", "--omega"}:
+            i += 2
+            continue
+        cmd.append(base_cmd[i])
+        i += 1
+    return [*cmd, "--seed", str(seed), "--omega", str(omega)]
+
+
 def run_single(
     task_key: str,
     omega: float,
+    seed: int,
     sweep_dir: Path,
     dry_run: bool,
 ) -> dict:
     task = TASKS[task_key]
-    cmd = [*task.base_cmd, "--omega", str(omega)]
-    run_name = f"{task_key}_omega{omega:.6f}"
+    cmd = cmd_with_overrides(task.base_cmd, seed, omega)
+    run_name = f"{task_key}_omega{omega:.6f}_seed{seed}"
     log_path = sweep_dir / "logs" / f"{run_name}.log"
 
     record = {
         "task": task_key,
         "omega": omega,
+        "seed": seed,
         "status": "pending",
         "command": cmd,
         "log_path": str(log_path.relative_to(sweep_dir)),
@@ -253,7 +309,7 @@ def run_single(
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
     start = time.time()
-    print(f"\n{'=' * 60}\n{task.name} | omega={omega:.6f}\n{'=' * 60}")
+    print(f"\n{'=' * 60}\n{task.name} | omega={omega:.6f} | seed={seed}\n{'=' * 60}")
     print(" ".join(cmd))
 
     proc = subprocess.run(
@@ -310,25 +366,41 @@ def plot_results(results: dict, plot_path: Path) -> None:
     }
 
     for ax, (task_key, task) in zip(axes, TASKS.items()):
-        entries = sorted(
-            [e for e in results.get(task_key, []) if e.get("status") == "ok"],
-            key=lambda e: e["omega"],
-        )
-        if not entries:
+        summary = aggregate_task_results(results.get(task_key, []))
+        if not summary:
             ax.set_title(f"{task.name}\n(no successful runs)")
             ax.set_xlabel(r"$\omega$")
             continue
 
-        omegas = [e["omega"] for e in entries]
-        metrics = [e["metric"] for e in entries]
-        ax.plot(omegas, metrics, "o-", color=colors[task_key], linewidth=2, markersize=5)
-        ax.axvline(task.omega_center, color=colors[task_key], linestyle="--", alpha=0.5, linewidth=1)
-        ax.set_title(task.name)
+        omegas = [row["omega"] for row in summary]
+        means = [row["mean"] for row in summary]
+        ci95 = [row["ci95"] for row in summary]
+        stds = [row["std"] for row in summary]
+        color = colors[task_key]
+
+        lower_ci = [m - c for m, c in zip(means, ci95)]
+        upper_ci = [m + c for m, c in zip(means, ci95)]
+        lower_std = [m - s for m, s in zip(means, stds)]
+        upper_std = [m + s for m, s in zip(means, stds)]
+
+        ax.fill_between(omegas, lower_std, upper_std, color=color, alpha=0.15, linewidth=0)
+        ax.fill_between(omegas, lower_ci, upper_ci, color=color, alpha=0.25, linewidth=0)
+        ax.plot(omegas, means, "o-", color=color, linewidth=2, markersize=5, label="mean")
+        ax.axvline(task.omega_center, color=color, linestyle="--", alpha=0.5, linewidth=1)
+
+        n_runs = summary[0]["n_runs"]
+        ax.set_title(f"{task.name}\n({n_runs} runs per $\\omega$)")
         ax.set_ylabel(task.metric_label)
         ax.set_xlabel(r"$\omega$ (natural frequency)")
         ax.grid(True, alpha=0.3)
 
-    fig.suptitle("Performance vs natural frequency $\\omega$", y=1.02)
+    handles = [
+        plt.Line2D([0], [0], color="gray", linewidth=2, marker="o", label="mean"),
+        plt.Rectangle((0, 0), 1, 1, facecolor="gray", alpha=0.25, label="95% CI"),
+        plt.Rectangle((0, 0), 1, 1, facecolor="gray", alpha=0.15, label=r"$\pm 1\sigma$"),
+    ]
+    fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 1.08), ncol=3, frameon=False)
+    fig.suptitle("Performance vs natural frequency $\\omega$", y=1.14)
     fig.tight_layout()
     plot_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(plot_path, dpi=200, bbox_inches="tight")
@@ -369,7 +441,24 @@ def main() -> None:
         default=None,
         help="Directory for sweep outputs (default: results/sweeps/omega_sweep_<timestamp>)",
     )
-    parser.add_argument("--skip-existing", action="store_true", help="Skip omegas already in results.json")
+    parser.add_argument(
+        "--num-runs",
+        type=int,
+        default=10,
+        help="Number of independent runs per (task, omega) with different seeds (default: 10)",
+    )
+    parser.add_argument(
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Explicit seeds to use (default: 1..num-runs)",
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip (task, omega, seed) combinations already in results.json",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print commands without running training")
     parser.add_argument("--plot-only", action="store_true", help="Only plot from existing results.json")
     parser.add_argument(
@@ -386,6 +475,7 @@ def main() -> None:
     plot_path = sweep_dir / "omega_sweep_performance.png"
 
     results = load_results(results_path)
+    seeds = args.seeds if args.seeds is not None else list(range(1, args.num_runs + 1))
 
     if args.with_manifold:
         for task in TASKS.values():
@@ -408,6 +498,8 @@ def main() -> None:
                     "omega_min": args.omega_min,
                     "omega_max": args.omega_max,
                     "omega_step": args.omega_step,
+                    "num_runs": args.num_runs,
+                    "seeds": seeds,
                     "task_grids": {
                         task_key: {
                             "omega_center": TASKS[task_key].omega_center,
@@ -433,30 +525,42 @@ def main() -> None:
         for task_key in args.tasks:
             if task_key not in results:
                 results[task_key] = []
-            done = existing_omegas(results, task_key) if args.skip_existing else set()
+            done = existing_completions(results, task_key) if args.skip_existing else set()
 
             for omega in task_grids[task_key]:
                 omega_key = round(float(omega), 10)
-                if omega_key in done:
-                    print(f"Skipping {task_key} omega={omega:.6f} (already completed)")
-                    continue
+                for seed in seeds:
+                    if (omega_key, seed) in done:
+                        print(
+                            f"Skipping {task_key} omega={omega:.6f} seed={seed} (already completed)"
+                        )
+                        continue
 
-                record = run_single(task_key, omega, sweep_dir, args.dry_run)
-                if record["status"] != "dry_run":
-                    results[task_key] = [
-                        e
-                        for e in results[task_key]
-                        if round(float(e.get("omega", -1)), 10) != omega_key
-                    ]
-                    results[task_key].append(record)
-                    save_results(results_path, results)
-                    save_csv(results_path, results)
+                    record = run_single(task_key, omega, seed, sweep_dir, args.dry_run)
+                    if record["status"] != "dry_run":
+                        results[task_key] = [
+                            e
+                            for e in results[task_key]
+                            if not (
+                                round(float(e.get("omega", -1)), 10) == omega_key
+                                and int(e.get("seed", -1)) == seed
+                            )
+                        ]
+                        results[task_key].append(record)
+                        save_results(results_path, results)
+                        save_csv(results_path, results)
+                        save_summary(results_path, results)
 
         save_results(results_path, results)
         save_csv(results_path, results)
+        save_summary(results_path, results)
+
+    else:
+        save_summary(results_path, results)
 
     plot_results(results, plot_path)
     print(f"\nResults: {results_path}")
+    print(f"Summary: {results_path.with_name('summary.json')}")
     print(f"CSV:     {results_path.with_suffix('.csv')}")
 
 

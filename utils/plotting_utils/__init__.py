@@ -21,6 +21,17 @@ from .parameters import (
     plot_weight_heatmaps,
 )
 from .regression import plot_regression_metrics
+from .class_encoding import plot_smnist_digit_encoding_analysis
+from .sentiment_encoding import (
+    find_class_examples_batch,
+    plot_imdb_sentiment_encoding_analysis,
+)
+from .signal_stages import (
+    find_class_examples,
+    plot_imdb_sentiment_comparison,
+    plot_signal_stages_for_example,
+    prepare_imdb_sequence,
+)
 from .training import (
     create_classification_gifs,
     create_mackey_glass_gifs,
@@ -62,4 +73,11 @@ __all__ = [
     "create_gif_from_files",
     "create_classification_gifs",
     "create_mackey_glass_gifs",
+    "plot_signal_stages_for_example",
+    "prepare_imdb_sequence",
+    "find_class_examples",
+    "plot_imdb_sentiment_comparison",
+    "find_class_examples_batch",
+    "plot_imdb_sentiment_encoding_analysis",
+    "plot_smnist_digit_encoding_analysis",
 ]

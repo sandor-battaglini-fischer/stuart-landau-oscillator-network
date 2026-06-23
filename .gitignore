@@ -212,3 +212,4 @@ __marimo__/
 scripts-to-incorporate/
 /data
 /results
+.DS_Store

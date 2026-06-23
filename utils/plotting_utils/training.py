@@ -137,6 +137,36 @@ def create_classification_gifs(output_dir):
         "confusion_matrix_normalized.gif",
         target_size=(1000, 800),
     )
+    create_gif_from_epoch_dirs(
+        output_dir,
+        "signal_stages_epoch*.png",
+        "signal_stages.gif",
+        target_size=(1200, 1400),
+    )
+    create_gif_from_epoch_dirs(
+        output_dir,
+        "sentiment_comparison_epoch*.png",
+        "sentiment_comparison.gif",
+        target_size=(1200, 1800),
+    )
+    create_gif_from_epoch_dirs(
+        output_dir,
+        "sentiment_encoding_separation_epoch*.png",
+        "sentiment_encoding_separation.gif",
+        target_size=(1200, 600),
+    )
+    create_gif_from_epoch_dirs(
+        output_dir,
+        "digit_encoding_separation_epoch*.png",
+        "digit_encoding_separation.gif",
+        target_size=(1200, 600),
+    )
+    create_gif_from_epoch_dirs(
+        output_dir,
+        "digit_readout_mapping_epoch*.png",
+        "digit_readout_mapping.gif",
+        target_size=(1000, 800),
+    )
 
 
 def plot_mackey_glass_snapshots(
@@ -273,3 +303,9 @@ def create_mackey_glass_gifs(output_dir):
             f"weight_heatmap_{layer}.gif",
             target_size=(600, 500),
         )
+    create_gif_from_epoch_dirs(
+        output_dir,
+        "signal_stages_epoch*.png",
+        "signal_stages.gif",
+        target_size=(1200, 1400),
+    )

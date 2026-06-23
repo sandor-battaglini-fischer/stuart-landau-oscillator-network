@@ -17,7 +17,13 @@ TASK = 'smnist'
 
 from utils.run_dirs import make_run_dir, sweep_summary_path, epoch_dir, save_training_checkpoint
 from utils.slon_analysis import extract_model_parameters, compute_parameter_statistics
-from utils.plotting_utils import plot_classification_epoch, create_classification_gifs
+from utils.plotting_utils import (
+    plot_classification_epoch,
+    create_classification_gifs,
+    plot_signal_stages_for_example,
+    plot_smnist_digit_encoding_analysis,
+    find_class_examples_batch,
+)
 from utils.manifold_dimension_analysis import analyze_manifold_dimension, collect_and_save_final_states
 
 # command line arguments
@@ -33,7 +39,7 @@ parser.add_argument('--alpha', type=float, default=0.04, help='excitability coef
 parser.add_argument('--omega', type=float, default=0.224, help='natural frequency omega') # 2 * pi / 28 for sMNIST
 parser.add_argument('--gamma', type=float, default=0.01, help='damping coefficient gamma')
 parser.add_argument('--lambda-param', type=float, default=0.1, help='Stuart-Landau: real part of linear coefficient lambda (default: -|gamma|)')
-parser.add_argument('--gamma-real', type=float, default=-0.05, help='Stuart-Landau: real part of nonlinear coefficient (default: -0.1)')
+parser.add_argument('--gamma-real', type=float, default=-0.1, help='Stuart-Landau: real part of nonlinear coefficient (default: -0.1)')
 parser.add_argument('--gamma-imag', type=float, default=0.1, help='Stuart-Landau: imaginary part of nonlinear coefficient (default: 0.0)')
 parser.add_argument('--sweep-omega', action='store_true', help='enable parameter sweep for omega')
 parser.add_argument('--omega-min', type=float, default=None, help='minimum omega value for sweep')
@@ -45,11 +51,19 @@ parser.add_argument('--lambda-max', type=float, default=None, help='maximum lamb
 parser.add_argument('--lambda-steps', type=int, default=10, help='number of steps for lambda sweep (default: 10)')
 parser.add_argument('--analyze-manifold', action='store_true', default=True,
                     help='Enable manifold dimension analysis (runs at end of training and every 10 epochs)')
+parser.add_argument('--digit-analysis-examples', type=int, default=5,
+                    help='number of test examples per digit for digit encoding analysis')
 
 args = parser.parse_args()
 
 if args.sweep_omega and args.sweep_lambda:
     raise ValueError("Cannot sweep both omega and lambda simultaneously. Choose one.")
+
+if args.lambda_param > 0:
+    print(
+        f"WARNING: lambda_param={args.lambda_param} > 0 can make Stuart-Landau dynamics diverge "
+        f"over 784 sMNIST steps (NaN logits). Use a negative value, e.g. --lambda-param -0.04."
+    )
 
 print(args)
 
@@ -186,6 +200,17 @@ def run_training(omega_value, lambda_value=None, sweep_idx=None, sweep_type=None
     train_losses = []
     val_losses = []
     test_losses = []
+    
+    example_images, example_label = next(iter(test_loader))
+    example_images = example_images[0:1]
+    example_label = int(example_label[0].item())
+    example_inputs = example_images.reshape(1, 1, 784).permute(2, 0, 1)
+
+    digit_batches = find_class_examples_batch(
+        test_loader,
+        labels=tuple(range(10)),
+        num_per_class=args.digit_analysis_examples,
+    )
     
     param_str = f'omega={omega_value:.6f}'
     if lambda_value is not None:
@@ -331,6 +356,45 @@ def run_training(omega_value, lambda_value=None, sweep_idx=None, sweep_type=None
                 fh_log.flush()
         except Exception as e:
             tqdm.write(f"Warning: Failed to generate plots at epoch {epoch}: {e}")
+
+        try:
+            plot_signal_stages_for_example(
+                model,
+                example_inputs,
+                ep_dir,
+                epoch,
+                input_mode="scalar",
+                task_type="classification",
+                class_labels=[str(i) for i in range(10)],
+                true_label=example_label,
+                num_units_plot=min(5, args.num_hidden),
+                raw_input_label="pixel value",
+                title_suffix=f"example digit: {example_label}",
+            )
+        except Exception as e:
+            tqdm.write(f"Warning: Failed to generate signal stage plots at epoch {epoch}: {e}")
+
+        try:
+            encoding_summary = plot_smnist_digit_encoding_analysis(
+                model,
+                digit_batches,
+                ep_dir,
+                epoch,
+                num_units_plot=min(5, args.num_hidden),
+                num_classes=10,
+            )
+            if not encoding_summary.get("dynamics_finite", True):
+                tqdm.write(
+                    f"Warning: digit encoding at epoch {epoch} has non-finite dynamics/logits. "
+                    f"Check lambda_param (should be negative, e.g. -0.04)."
+                )
+            fh_log.write(
+                f"Digit encoding epoch {epoch}: "
+                f"mean_margin={np.mean(list(encoding_summary['per_digit_mean_logit_margin'].values())):.4f}\n"
+            )
+            fh_log.flush()
+        except Exception as e:
+            tqdm.write(f"Warning: Failed to generate digit encoding analysis at epoch {epoch}: {e}")
 
         metrics_file = f"{output_dir}/metrics.json"
         metrics_data = {

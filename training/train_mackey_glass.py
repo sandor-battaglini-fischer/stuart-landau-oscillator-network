@@ -25,6 +25,7 @@ from utils.plotting_utils import (
     plot_mackey_glass_parameter_analysis,
     plot_epoch_weight_heatmaps,
     create_mackey_glass_gifs,
+    plot_signal_stages_for_example,
 )
 
 
@@ -486,6 +487,7 @@ def run_training(
         example_sampled_idx = 0
     example_input = example_inputs[0]
     example_target = example_targets[0]
+    example_signal_inputs = example_input.unsqueeze(0).permute(1, 0, 2)
     
     tau_steps = int(args.mg_tau / args.mg_delta_t)
 
@@ -555,6 +557,22 @@ def run_training(
         all_test_target_indices=all_test_target_indices,
         is_initial=True,
     )
+
+    try:
+        plot_signal_stages_for_example(
+            model,
+            example_signal_inputs,
+            output_dir,
+            epoch=None,
+            input_mode="scalar",
+            task_type="regression",
+            target_value=float(example_target.squeeze().item()),
+            num_units_plot=min(5, args.num_hidden),
+            raw_input_label="MG value",
+            title_suffix="initial (before training)",
+        )
+    except Exception as e:
+        print(f"Warning: Failed to generate initial signal stage plots: {e}")
 
     print("Initial plots generated.")
 
@@ -783,6 +801,22 @@ def run_training(
             scatter_xlim=scatter_xlim,
             scatter_ylim=scatter_ylim,
         )
+
+        try:
+            plot_signal_stages_for_example(
+                model,
+                example_signal_inputs,
+                ep_dir,
+                epoch,
+                input_mode="scalar",
+                task_type="regression",
+                target_value=float(example_target.squeeze().item()),
+                num_units_plot=min(5, args.num_hidden),
+                raw_input_label="MG value",
+                title_suffix=f"target = {float(example_target.squeeze().item()):.4f}",
+            )
+        except Exception as e:
+            tqdm.write(f"Warning: Failed to generate signal stage plots at epoch {epoch}: {e}")
 
         is_best = val_normalized < best_val_normalized
         if is_best:
