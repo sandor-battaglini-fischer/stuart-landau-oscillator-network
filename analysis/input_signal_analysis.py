@@ -143,7 +143,7 @@ def plot_single_example_time_series(pre_acts, output_dir, prefix, num_units=5, e
     for idx in unit_indices:
         plt.plot(t, series[:, idx], label=f"unit {idx}")
     plt.xlabel("time step")
-    plt.ylabel(r"pre-activation $u(t)=W_{i2h}x(t)+\mathrm{gain}_{\mathrm{rec}}W_{h2h}\Re(z(t))$")
+    plt.ylabel(r"pre-activation $u(t)=W_{i2h}x(t)+\mathrm{gain}_{\mathrm{rec}}W_{h2h}[\Re(z),\Im(z)]$")
     plt.legend()
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, f"{prefix}_single_example_time_series.png"), transparent=True)

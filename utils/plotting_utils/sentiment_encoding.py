@@ -54,7 +54,8 @@ def trace_model_signal_stages_batch(model, inputs, input_mode="norm"):
     for t in range(num_timesteps):
         input_t = inputs[t]
         projected = slon.i2h(input_t)
-        pre_act = projected + slon.gain_rec * slon.h2h(z_real)
+        z_state = torch.cat([z_real, z_imag], dim=1)
+        pre_act = projected + slon.gain_rec * slon.h2h(z_state)
         z_real, z_imag = slon.dynamics_step(z_real, z_imag, input_t)
 
         projected_inputs.append(projected.detach().cpu())
@@ -62,7 +63,8 @@ def trace_model_signal_stages_batch(model, inputs, input_mode="norm"):
         z_real_trace.append(z_real.detach().cpu())
         z_mag_trace.append(torch.sqrt(z_real ** 2 + z_imag ** 2).detach().cpu())
 
-    logits = slon.h2o(z_real).detach().cpu()
+    z_features = torch.cat([z_real, z_imag], dim=1)
+    logits = slon.h2o(z_features).detach().cpu()
     if input_mode == "norm":
         raw_input = inputs.norm(dim=-1).detach().cpu().numpy()
     else:

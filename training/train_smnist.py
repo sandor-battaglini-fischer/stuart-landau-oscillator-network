@@ -29,7 +29,7 @@ from utils.manifold_dimension_analysis import analyze_manifold_dimension, collec
 # command line arguments
 parser = argparse.ArgumentParser(description='SLON training script for sMNIST')
 parser.add_argument('--num-hidden', type=int, default=50, help='number of units')
-parser.add_argument('--epochs', type=int, default=50, help='number of training epochs')
+parser.add_argument('--epochs', type=int, default=20, help='number of training epochs')
 parser.add_argument('--batch-size', type=int, default=64, help='batch size')
 parser.add_argument('--shuffle', action = 'store_true', help='whether to shuffle stimulus time steps')
 parser.add_argument('--seed', type=int, default=1, help='random seed')
@@ -40,7 +40,7 @@ parser.add_argument('--omega', type=float, default=0.224, help='natural frequenc
 parser.add_argument('--gamma', type=float, default=0.01, help='damping coefficient gamma')
 parser.add_argument('--lambda-param', type=float, default=0.1, help='Stuart-Landau: real part of linear coefficient lambda (default: -|gamma|)')
 parser.add_argument('--gamma-real', type=float, default=-0.1, help='Stuart-Landau: real part of nonlinear coefficient (default: -0.1)')
-parser.add_argument('--gamma-imag', type=float, default=0.1, help='Stuart-Landau: imaginary part of nonlinear coefficient (default: 0.0)')
+parser.add_argument('--gamma-imag', type=float, default=-0.1, help='Stuart-Landau: imaginary part of nonlinear coefficient (default: 0.0)')
 parser.add_argument('--sweep-omega', action='store_true', help='enable parameter sweep for omega')
 parser.add_argument('--omega-min', type=float, default=None, help='minimum omega value for sweep')
 parser.add_argument('--omega-max', type=float, default=None, help='maximum omega value for sweep')
@@ -51,7 +51,7 @@ parser.add_argument('--lambda-max', type=float, default=None, help='maximum lamb
 parser.add_argument('--lambda-steps', type=int, default=10, help='number of steps for lambda sweep (default: 10)')
 parser.add_argument('--analyze-manifold', action='store_true', default=True,
                     help='Enable manifold dimension analysis (runs at end of training and every 10 epochs)')
-parser.add_argument('--digit-analysis-examples', type=int, default=5,
+parser.add_argument('--digit-analysis-examples', type=int, default=20,
                     help='number of test examples per digit for digit encoding analysis')
 
 args = parser.parse_args()

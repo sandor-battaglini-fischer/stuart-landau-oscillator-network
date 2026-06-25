@@ -47,7 +47,8 @@ def compute_signal_stages(slon, inputs, example_idx=0, input_mode="scalar"):
     for t in range(num_timesteps):
         input_t = inputs[t]
         projected = slon.i2h(input_t)
-        pre_act = projected + slon.gain_rec * slon.h2h(z_real)
+        z_state = torch.cat([z_real, z_imag], dim=1)
+        pre_act = projected + slon.gain_rec * slon.h2h(z_state)
         input_force = slon.alpha * torch.tanh(pre_act)
 
         z_real, z_imag = slon.dynamics_step(z_real, z_imag, input_t)
@@ -58,7 +59,8 @@ def compute_signal_stages(slon, inputs, example_idx=0, input_mode="scalar"):
         z_real_trace.append(z_real[example_idx].detach().cpu())
         z_mag_trace.append(torch.sqrt(z_real[example_idx] ** 2 + z_imag[example_idx] ** 2).detach().cpu())
 
-    logits = slon.h2o(z_real[example_idx : example_idx + 1]).squeeze(0).detach().cpu()
+    z_features = torch.cat([z_real, z_imag], dim=1)
+    logits = slon.h2o(z_features[example_idx : example_idx + 1]).squeeze(0).detach().cpu()
     raw_input = compute_raw_input_trace(inputs, example_idx=example_idx, input_mode=input_mode)
 
     return {

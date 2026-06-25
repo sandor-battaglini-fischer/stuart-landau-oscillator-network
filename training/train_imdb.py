@@ -83,7 +83,7 @@ parser.add_argument('--cache-dir', type=str, default=os.path.join(DATA_DIR, 'imd
 parser.add_argument('--force-reprocess', action='store_true', help='force reprocessing even if cached data exists')
 parser.add_argument('--analyze-manifold', action='store_true', default=True,
                     help='Enable manifold dimension analysis (runs at end of training and every 10 epochs)')
-parser.add_argument('--sentiment-analysis-examples', type=int, default=30,
+parser.add_argument('--sentiment-analysis-examples', type=int, default=100,
                     help='number of positive/negative test reviews for sentiment encoding analysis')
 
 def tokenize(text):

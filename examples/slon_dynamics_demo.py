@@ -33,7 +33,7 @@ model.eval()
 
 model.i2h.weight[:, :] = torch.randn(num_hidden, 1)
 model.i2h.bias[:] = 0
-model.h2h.weight[:, :] = torch.randn(num_hidden, num_hidden) * 0.1
+model.h2h.weight[:, :] = torch.randn(num_hidden, num_hidden * 2) * 0.1
 model.h2h.bias[:] = 0
 
 plt.matshow(model.h2h.weight.detach().numpy())

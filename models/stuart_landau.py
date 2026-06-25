@@ -38,8 +38,8 @@ class SLON(torch.nn.Module):
         self.gain_rec = 1. / math.sqrt(self.num_nodes)
 
         self.i2h = torch.nn.Linear(num_input, num_nodes)
-        self.h2h = torch.nn.Linear(num_nodes, num_nodes)
-        self.h2o = torch.nn.Linear(num_nodes, num_output)
+        self.h2h = torch.nn.Linear(num_nodes * 2, num_nodes)
+        self.h2o = torch.nn.Linear(num_nodes * 2, num_output)
 
     def dynamics_step(self, z_real, z_imag, input_t):
         z = torch.complex(z_real, z_imag)
@@ -47,9 +47,11 @@ class SLON(torch.nn.Module):
         lambda_omega_coeff = torch.complex(self.lambda_param, self.omega_param)
         gamma_coeff = torch.complex(self.gamma_real, self.gamma_imag)
         
+        z_state = torch.cat([z_real, z_imag], dim=1)
+        
         input_force = self.alpha * torch.tanh(
             self.i2h(input_t)
-            + self.gain_rec * self.h2h(z_real)
+            + self.gain_rec * self.h2h(z_state)
         )
         
         dz_dt = lambda_omega_coeff * z + gamma_coeff * torch.abs(z)**2 * z + torch.complex(input_force, torch.zeros_like(input_force))
@@ -87,7 +89,8 @@ class SLON(torch.nn.Module):
                 rec_z_real[:, t, :] = z_real
                 rec_z_imag[:, t, :] = z_imag
 
-        output = self.h2o(z_real)
+        z_features = torch.cat([z_real, z_imag], dim=1)
+        output = self.h2o(z_features)
 
         ret['output'] = output
         return ret
