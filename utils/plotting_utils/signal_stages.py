@@ -42,6 +42,7 @@ def compute_signal_stages(slon, inputs, example_idx=0, input_mode="scalar"):
     pre_activations = []
     input_forces = []
     z_real_trace = []
+    z_imag_trace = []
     z_mag_trace = []
 
     for t in range(num_timesteps):
@@ -57,6 +58,7 @@ def compute_signal_stages(slon, inputs, example_idx=0, input_mode="scalar"):
         pre_activations.append(pre_act[example_idx].detach().cpu())
         input_forces.append(input_force[example_idx].detach().cpu())
         z_real_trace.append(z_real[example_idx].detach().cpu())
+        z_imag_trace.append(z_imag[example_idx].detach().cpu())
         z_mag_trace.append(torch.sqrt(z_real[example_idx] ** 2 + z_imag[example_idx] ** 2).detach().cpu())
 
     z_features = torch.cat([z_real, z_imag], dim=1)
@@ -69,6 +71,7 @@ def compute_signal_stages(slon, inputs, example_idx=0, input_mode="scalar"):
         "pre_activation": torch.stack(pre_activations).numpy(),
         "input_force": torch.stack(input_forces).numpy(),
         "z_real": torch.stack(z_real_trace).numpy(),
+        "z_imag": torch.stack(z_imag_trace).numpy(),
         "z_magnitude": torch.stack(z_mag_trace).numpy(),
         "logits": logits.numpy(),
     }
@@ -138,7 +141,7 @@ def plot_signal_stages(
     unit_indices = _unit_indices(num_nodes, num_units_plot)
     t = np.arange(num_timesteps)
 
-    fig, axes = plt.subplots(4, 1, figsize=(12, 14), sharex=True)
+    fig, axes = plt.subplots(5, 1, figsize=(12, 17), sharex=True)
 
     axes[0].plot(t, stages["raw_input"], color=thesis_blue, linewidth=1.5)
     axes[0].set_ylabel(raw_input_label)
@@ -161,18 +164,27 @@ def plot_signal_stages(
         stages["z_real"],
         unit_indices,
         r"$\Re(z(t))$",
-        "node state after dynamics (before readout)",
+        "node state real part (before readout)",
+    )
+
+    _plot_unit_traces(
+        axes[3],
+        t,
+        stages["z_imag"],
+        unit_indices,
+        r"$\Im(z(t))$",
+        "node state imaginary part (before readout)",
     )
 
     _plot_output_panel(
-        axes[3],
+        axes[4],
         stages["logits"],
         task_type=task_type,
         class_labels=class_labels,
         true_label=true_label,
         target_value=target_value,
     )
-    axes[3].set_xlabel("class")
+    axes[4].set_xlabel("class")
 
     if title_suffix:
         fig.suptitle(title_suffix, y=1.01)

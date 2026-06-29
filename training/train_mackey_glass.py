@@ -506,98 +506,96 @@ def run_training(
     grad_norms = []
     parameters_history = []
 
-    # Generate initial plots before training starts
-    print("Generating initial plots before training...")
-    model.eval()
-    with torch.no_grad():
-        ex_batch = example_input.unsqueeze(0)
-        ex_batch = ex_batch.permute(1, 0, 2)
-        ex_out = model(ex_batch)
-        ex_pred = ex_out["output"][0, 0].item()
+    if not args.skip_epoch_plots:
+        print("Generating initial plots before training...")
+        model.eval()
+        with torch.no_grad():
+            ex_batch = example_input.unsqueeze(0)
+            ex_batch = ex_batch.permute(1, 0, 2)
+            ex_out = model(ex_batch)
+            ex_pred = ex_out["output"][0, 0].item()
 
-    window = example_input.squeeze(-1).detach().cpu().numpy()
-    target_val = example_target.squeeze().item()
+        window = example_input.squeeze(-1).detach().cpu().numpy()
+        target_val = example_target.squeeze().item()
 
-    total_len = int(args.series_length * (1 - args.test_fraction - args.val_fraction))
-    val_len = int(args.series_length * args.val_fraction)
-    test_start = total_len + val_len
-    
-    train_series = full_series[:total_len]
-    test_series = full_series[test_start:]
-    
-    train_sampled_indices = np.arange(0, total_len, 1)
-    test_sampled_indices = np.arange(test_start, len(full_series), 1)
-    
-    example_sampled_idx_full = test_start + example_sampled_idx
-    start_idx = max(0, example_sampled_idx_full - args.input_length + 1)
-    example_input_indices = np.arange(start_idx, example_sampled_idx_full + 1)
-    
-    example_target_idx = example_sampled_idx_full + args.horizon
-    if example_target_idx >= len(full_series):
-        example_target_idx = len(full_series) - 1
+        total_len = int(args.series_length * (1 - args.test_fraction - args.val_fraction))
+        val_len = int(args.series_length * args.val_fraction)
+        test_start = total_len + val_len
+        
+        train_series = full_series[:total_len]
+        test_series = full_series[test_start:]
+        
+        train_sampled_indices = np.arange(0, total_len, 1)
+        test_sampled_indices = np.arange(test_start, len(full_series), 1)
+        
+        example_sampled_idx_full = test_start + example_sampled_idx
+        start_idx = max(0, example_sampled_idx_full - args.input_length + 1)
+        example_input_indices = np.arange(start_idx, example_sampled_idx_full + 1)
+        
+        example_target_idx = example_sampled_idx_full + args.horizon
+        if example_target_idx >= len(full_series):
+            example_target_idx = len(full_series) - 1
 
-    all_test_preds, all_test_targets, all_test_target_indices, all_test_input_windows = collect_all_test_predictions(
-        test_loader, model, batch_size, test_start, args.horizon
-    )
-    
-    plot_mackey_glass_snapshots(
-        output_dir=output_dir,
-        full_series=full_series,
-        example_input_indices=example_input_indices,
-        example_target_idx=example_target_idx,
-        ex_pred=ex_pred,
-        example_sampled_idx_full=example_sampled_idx_full,
-        start_idx=start_idx,
-        tau_steps=tau_steps,
-        train_sampled_indices=train_sampled_indices,
-        test_start=test_start,
-        args=args,
-        all_test_preds=all_test_preds,
-        all_test_targets=all_test_targets,
-        all_test_target_indices=all_test_target_indices,
-        is_initial=True,
-    )
-
-    try:
-        plot_signal_stages_for_example(
-            model,
-            example_signal_inputs,
-            output_dir,
-            epoch=None,
-            input_mode="scalar",
-            task_type="regression",
-            target_value=float(example_target.squeeze().item()),
-            num_units_plot=min(5, args.num_hidden),
-            raw_input_label="MG value",
-            title_suffix="initial (before training)",
+        all_test_preds, all_test_targets, all_test_target_indices, all_test_input_windows = collect_all_test_predictions(
+            test_loader, model, batch_size, test_start, args.horizon
         )
-    except Exception as e:
-        print(f"Warning: Failed to generate initial signal stage plots: {e}")
+        
+        plot_mackey_glass_snapshots(
+            output_dir=output_dir,
+            full_series=full_series,
+            example_input_indices=example_input_indices,
+            example_target_idx=example_target_idx,
+            ex_pred=ex_pred,
+            example_sampled_idx_full=example_sampled_idx_full,
+            start_idx=start_idx,
+            tau_steps=tau_steps,
+            train_sampled_indices=train_sampled_indices,
+            test_start=test_start,
+            args=args,
+            all_test_preds=all_test_preds,
+            all_test_targets=all_test_targets,
+            all_test_target_indices=all_test_target_indices,
+            is_initial=True,
+        )
 
-    print("Initial plots generated.")
+        try:
+            plot_signal_stages_for_example(
+                model,
+                example_signal_inputs,
+                output_dir,
+                epoch=None,
+                input_mode="scalar",
+                task_type="regression",
+                target_value=float(example_target.squeeze().item()),
+                num_units_plot=min(5, args.num_hidden),
+                raw_input_label="MG value",
+                title_suffix="initial (before training)",
+            )
+        except Exception as e:
+            print(f"Warning: Failed to generate initial signal stage plots: {e}")
+
+        print("Initial plots generated.")
+
+    scatter_xlim = None
+    scatter_ylim = None
+    if not args.skip_epoch_plots:
+        all_test_targets_for_limits = []
+        with torch.no_grad():
+            for batch in test_loader:
+                if len(batch) >= 2:
+                    targets = batch[1]
+                    all_test_targets_for_limits.append(targets.detach().cpu().numpy().reshape(-1))
+        if all_test_targets_for_limits:
+            all_test_targets_flat = np.concatenate(all_test_targets_for_limits)
+            scatter_min = np.min(all_test_targets_flat)
+            scatter_max = np.max(all_test_targets_flat)
+            scatter_margin = (scatter_max - scatter_min) * 0.05
+            scatter_xlim = [scatter_min - scatter_margin, scatter_max + scatter_margin]
+            scatter_ylim = [scatter_min - scatter_margin, scatter_max + scatter_margin]
 
     total_len = int(args.series_length * (1 - args.test_fraction - args.val_fraction))
     val_len = int(args.series_length * args.val_fraction)
     test_start = total_len + val_len
-    
-    all_test_targets_for_limits = []
-    with torch.no_grad():
-        for batch in test_loader:
-            if len(batch) >= 2:
-                targets = batch[1]
-                all_test_targets_for_limits.append(targets.detach().cpu().numpy().reshape(-1))
-    if all_test_targets_for_limits:
-        all_test_targets_flat = np.concatenate(all_test_targets_for_limits)
-        scatter_min = np.min(all_test_targets_flat)
-        scatter_max = np.max(all_test_targets_flat)
-        scatter_margin = (scatter_max - scatter_min) * 0.05
-        scatter_xlim = [scatter_min - scatter_margin, scatter_max + scatter_margin]
-        scatter_ylim = [scatter_min - scatter_margin, scatter_max + scatter_margin]
-    else:
-        scatter_xlim = None
-        scatter_ylim = None
-    
-    pred_xlim = [test_start, len(full_series)]
     pred_ymin = np.min(full_series[test_start:])
     pred_ymax = np.max(full_series[test_start:])
     pred_ymargin = (pred_ymax - pred_ymin) * 0.1
@@ -700,14 +698,15 @@ def run_training(
         val_normalized_errors.append(val_normalized)
         test_normalized_errors.append(test_normalized)
 
-        plot_regression_metrics(
-            train_losses, val_losses, test_losses,
-            test_r2_scores=test_r2_scores,
-            test_normalized_errors=test_normalized_errors,
-            val_r2_scores=val_r2_scores,
-            val_normalized_errors=val_normalized_errors,
-            output_dir=output_dir
-        )
+        if not args.skip_epoch_plots:
+            plot_regression_metrics(
+                train_losses, val_losses, test_losses,
+                test_r2_scores=test_r2_scores,
+                test_normalized_errors=test_normalized_errors,
+                val_r2_scores=val_r2_scores,
+                val_normalized_errors=val_normalized_errors,
+                output_dir=output_dir
+            )
 
         metrics_file = f"{output_dir}/metrics.json"
         metrics_data = {
@@ -746,77 +745,78 @@ def run_training(
         with open(params_file, "w") as f:
             json.dump(parameters_history, f, indent=2)
         
-        plot_mackey_glass_parameter_analysis(parameters_history, output_dir, epoch, fh_log=fh_log)
+        if not args.skip_epoch_plots:
+            plot_mackey_glass_parameter_analysis(parameters_history, output_dir, epoch, fh_log=fh_log)
 
-        model.eval()
-        with torch.no_grad():
-            ex_batch = example_input.unsqueeze(0)
-            ex_batch = ex_batch.permute(1, 0, 2)
-            ex_out = model(ex_batch)
-            ex_pred = ex_out["output"][0, 0].item()
+            model.eval()
+            with torch.no_grad():
+                ex_batch = example_input.unsqueeze(0)
+                ex_batch = ex_batch.permute(1, 0, 2)
+                ex_out = model(ex_batch)
+                ex_pred = ex_out["output"][0, 0].item()
 
-        window = example_input.squeeze(-1).detach().cpu().numpy()
-        target_val = example_target.squeeze().item()
+            window = example_input.squeeze(-1).detach().cpu().numpy()
+            target_val = example_target.squeeze().item()
 
-        total_len = int(args.series_length * (1 - args.test_fraction - args.val_fraction))
-        val_len = int(args.series_length * args.val_fraction)
-        test_start = total_len + val_len
-        
-        train_series = full_series[:total_len]
-        test_series = full_series[test_start:]
-        
-        train_sampled_indices = np.arange(0, total_len, 1)
-        test_sampled_indices = np.arange(test_start, len(full_series), 1)
-        
-        example_sampled_idx_full = test_start + example_sampled_idx
-        start_idx = max(0, example_sampled_idx_full - args.input_length + 1)
-        example_input_indices = np.arange(start_idx, example_sampled_idx_full + 1)
-        
-        example_target_idx = example_sampled_idx_full + args.horizon
-        if example_target_idx >= len(full_series):
-            example_target_idx = len(full_series) - 1
+            total_len = int(args.series_length * (1 - args.test_fraction - args.val_fraction))
+            val_len = int(args.series_length * args.val_fraction)
+            test_start = total_len + val_len
+            
+            train_series = full_series[:total_len]
+            test_series = full_series[test_start:]
+            
+            train_sampled_indices = np.arange(0, total_len, 1)
+            test_sampled_indices = np.arange(test_start, len(full_series), 1)
+            
+            example_sampled_idx_full = test_start + example_sampled_idx
+            start_idx = max(0, example_sampled_idx_full - args.input_length + 1)
+            example_input_indices = np.arange(start_idx, example_sampled_idx_full + 1)
+            
+            example_target_idx = example_sampled_idx_full + args.horizon
+            if example_target_idx >= len(full_series):
+                example_target_idx = len(full_series) - 1
 
-        all_test_preds, all_test_targets, all_test_target_indices, all_test_input_windows = collect_all_test_predictions(
-            test_loader, model, batch_size, test_start, args.horizon
-        )
-        
-        ep_dir = epoch_dir(output_dir, epoch)
-        plot_epoch_weight_heatmaps(parameters_history, ep_dir, epoch)
-        plot_mackey_glass_snapshots(
-            output_dir=ep_dir,
-            full_series=full_series,
-            example_input_indices=example_input_indices,
-            example_target_idx=example_target_idx,
-            ex_pred=ex_pred,
-            example_sampled_idx_full=example_sampled_idx_full,
-            start_idx=start_idx,
-            tau_steps=tau_steps,
-            train_sampled_indices=train_sampled_indices,
-            test_start=test_start,
-            args=args,
-            all_test_preds=all_test_preds,
-            all_test_targets=all_test_targets,
-            all_test_target_indices=all_test_target_indices,
-            epoch=epoch,
-            scatter_xlim=scatter_xlim,
-            scatter_ylim=scatter_ylim,
-        )
-
-        try:
-            plot_signal_stages_for_example(
-                model,
-                example_signal_inputs,
-                ep_dir,
-                epoch,
-                input_mode="scalar",
-                task_type="regression",
-                target_value=float(example_target.squeeze().item()),
-                num_units_plot=min(5, args.num_hidden),
-                raw_input_label="MG value",
-                title_suffix=f"target = {float(example_target.squeeze().item()):.4f}",
+            all_test_preds, all_test_targets, all_test_target_indices, all_test_input_windows = collect_all_test_predictions(
+                test_loader, model, batch_size, test_start, args.horizon
             )
-        except Exception as e:
-            tqdm.write(f"Warning: Failed to generate signal stage plots at epoch {epoch}: {e}")
+            
+            ep_dir = epoch_dir(output_dir, epoch)
+            plot_epoch_weight_heatmaps(parameters_history, ep_dir, epoch)
+            plot_mackey_glass_snapshots(
+                output_dir=ep_dir,
+                full_series=full_series,
+                example_input_indices=example_input_indices,
+                example_target_idx=example_target_idx,
+                ex_pred=ex_pred,
+                example_sampled_idx_full=example_sampled_idx_full,
+                start_idx=start_idx,
+                tau_steps=tau_steps,
+                train_sampled_indices=train_sampled_indices,
+                test_start=test_start,
+                args=args,
+                all_test_preds=all_test_preds,
+                all_test_targets=all_test_targets,
+                all_test_target_indices=all_test_target_indices,
+                epoch=epoch,
+                scatter_xlim=scatter_xlim,
+                scatter_ylim=scatter_ylim,
+            )
+
+            try:
+                plot_signal_stages_for_example(
+                    model,
+                    example_signal_inputs,
+                    ep_dir,
+                    epoch,
+                    input_mode="scalar",
+                    task_type="regression",
+                    target_value=float(example_target.squeeze().item()),
+                    num_units_plot=min(5, args.num_hidden),
+                    raw_input_label="MG value",
+                    title_suffix=f"target = {float(example_target.squeeze().item()):.4f}",
+                )
+            except Exception as e:
+                tqdm.write(f"Warning: Failed to generate signal stage plots at epoch {epoch}: {e}")
 
         is_best = val_normalized < best_val_normalized
         if is_best:
@@ -841,7 +841,7 @@ def run_training(
         save_training_checkpoint(model, output_dir, is_best=is_best)
         tqdm.write(f'wrote checkpoint last_model.pt{" + best_model.pt" if is_best else ""}')
 
-        if epoch == args.epochs - 1:
+        if not args.skip_epoch_plots and epoch == args.epochs - 1:
             promote_epoch_artifacts(ep_dir, output_dir, {
                 f"mg_pred_epoch{epoch:02d}.png": "mg_pred.png",
                 f"mg_pred_epoch{epoch:02d}_zoom.png": "mg_pred_zoom.png",
@@ -851,7 +851,7 @@ def run_training(
                 f"predictions_on_test_epoch{epoch:02d}_avg.png": "predictions_on_test_avg.png",
             })
         
-        if args.analyze_manifold:
+        if args.analyze_manifold and not args.skip_epoch_plots:
             try:
                 tqdm.write(f"\nRunning manifold dimension analysis at epoch {epoch}...")
                 manifold_results_epoch = analyze_manifold_dimension(
@@ -873,7 +873,7 @@ def run_training(
                 tqdm.write(f"Warning: Manifold dimension analysis failed at epoch {epoch}: {e}")
 
 
-    if len(parameters_history) > 0:
+    if len(parameters_history) > 0 and not args.skip_epoch_plots:
         create_mackey_glass_gifs(output_dir)
     
 
@@ -881,7 +881,7 @@ def run_training(
     fh_log.write(msg + "\n")
     fh_log.flush()
     
-    if args.analyze_manifold:
+    if args.analyze_manifold and not args.skip_epoch_plots:
         print("\n" + "=" * 60)
         print("Computing final manifold dimension analysis...")
         print("=" * 60 + "\n")
@@ -1020,6 +1020,8 @@ def main():
                         help="Minimum LR as fraction of initial LR (default: 0.0)")
     parser.add_argument("--analyze-manifold", action="store_true",
                         help="Enable manifold dimension analysis (runs at end of training and every 10 epochs)", default=True)
+    parser.add_argument("--skip-epoch-plots", action="store_true",
+                        help="Skip per-epoch plots and manifold analysis (metrics still saved)")
 
     args = parser.parse_args()
 

@@ -151,21 +151,27 @@ def create_classification_gifs(output_dir):
     )
     create_gif_from_epoch_dirs(
         output_dir,
-        "sentiment_encoding_separation_epoch*.png",
-        "sentiment_encoding_separation.gif",
+        "sentiment_phase_magnitude_separation_epoch*.png",
+        "sentiment_phase_magnitude_separation.gif",
         target_size=(1200, 600),
     )
     create_gif_from_epoch_dirs(
         output_dir,
-        "digit_encoding_separation_epoch*.png",
-        "digit_encoding_separation.gif",
-        target_size=(1200, 600),
+        "digit_phase_magnitude_separation_epoch*.png",
+        "digit_phase_magnitude_separation.gif",
+        target_size=(1200, 700),
     )
     create_gif_from_epoch_dirs(
         output_dir,
-        "digit_readout_mapping_epoch*.png",
-        "digit_readout_mapping.gif",
-        target_size=(1000, 800),
+        "digit_spectra_all_stages_epoch*.png",
+        "digit_spectra_all_stages.gif",
+        target_size=(1600, 2000),
+    )
+    create_gif_from_epoch_dirs(
+        output_dir,
+        "digit_real_imag_spectra_epoch*.png",
+        "digit_real_imag_spectra.gif",
+        target_size=(1400, 800),
     )
 
 

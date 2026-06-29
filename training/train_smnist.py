@@ -51,6 +51,8 @@ parser.add_argument('--lambda-max', type=float, default=None, help='maximum lamb
 parser.add_argument('--lambda-steps', type=int, default=10, help='number of steps for lambda sweep (default: 10)')
 parser.add_argument('--analyze-manifold', action='store_true', default=True,
                     help='Enable manifold dimension analysis (runs at end of training and every 10 epochs)')
+parser.add_argument('--skip-epoch-plots', action='store_true',
+                    help='Skip per-epoch plots and manifold analysis (metrics still saved)')
 parser.add_argument('--digit-analysis-examples', type=int, default=20,
                     help='number of test examples per digit for digit encoding analysis')
 
@@ -206,11 +208,13 @@ def run_training(omega_value, lambda_value=None, sweep_idx=None, sweep_type=None
     example_label = int(example_label[0].item())
     example_inputs = example_images.reshape(1, 1, 784).permute(2, 0, 1)
 
-    digit_batches = find_class_examples_batch(
-        test_loader,
-        labels=tuple(range(10)),
-        num_per_class=args.digit_analysis_examples,
-    )
+    digit_batches = None
+    if not args.skip_epoch_plots:
+        digit_batches = find_class_examples_batch(
+            test_loader,
+            labels=tuple(range(10)),
+            num_per_class=args.digit_analysis_examples,
+        )
     
     param_str = f'omega={omega_value:.6f}'
     if lambda_value is not None:
@@ -332,69 +336,73 @@ def run_training(omega_value, lambda_value=None, sweep_idx=None, sweep_type=None
             json.dump(parameters_history, f, indent=2)
 
         ep_dir = epoch_dir(output_dir, epoch)
-        try:
-            cm = plot_classification_epoch(
-                output_dir=output_dir,
-                ep_dir=ep_dir,
-                epoch=epoch,
-                train_accs=train_accs,
-                val_accs=val_accs,
-                test_accs=test_accs,
-                train_losses=train_losses,
-                val_losses=val_losses,
-                test_losses=test_losses,
-                test_labels=test_labels,
-                test_preds=test_preds,
-                parameters_history=parameters_history,
-                num_classes=10,
-                is_last_epoch=(epoch == args.epochs - 1),
-            )
-            if cm is not None:
-                per_class_acc = cm.diagonal() / (cm.sum(axis=1) + 1e-10)
-                per_class_acc_dict = {f"digit_{i}": f"{acc*100:.2f}%" for i, acc in enumerate(per_class_acc)}
-                fh_log.write(f"Per-class accuracies: {per_class_acc_dict}\n")
-                fh_log.flush()
-        except Exception as e:
-            tqdm.write(f"Warning: Failed to generate plots at epoch {epoch}: {e}")
-
-        try:
-            plot_signal_stages_for_example(
-                model,
-                example_inputs,
-                ep_dir,
-                epoch,
-                input_mode="scalar",
-                task_type="classification",
-                class_labels=[str(i) for i in range(10)],
-                true_label=example_label,
-                num_units_plot=min(5, args.num_hidden),
-                raw_input_label="pixel value",
-                title_suffix=f"example digit: {example_label}",
-            )
-        except Exception as e:
-            tqdm.write(f"Warning: Failed to generate signal stage plots at epoch {epoch}: {e}")
-
-        try:
-            encoding_summary = plot_smnist_digit_encoding_analysis(
-                model,
-                digit_batches,
-                ep_dir,
-                epoch,
-                num_units_plot=min(5, args.num_hidden),
-                num_classes=10,
-            )
-            if not encoding_summary.get("dynamics_finite", True):
-                tqdm.write(
-                    f"Warning: digit encoding at epoch {epoch} has non-finite dynamics/logits. "
-                    f"Check lambda_param (should be negative, e.g. -0.04)."
+        if not args.skip_epoch_plots:
+            try:
+                cm = plot_classification_epoch(
+                    output_dir=output_dir,
+                    ep_dir=ep_dir,
+                    epoch=epoch,
+                    train_accs=train_accs,
+                    val_accs=val_accs,
+                    test_accs=test_accs,
+                    train_losses=train_losses,
+                    val_losses=val_losses,
+                    test_losses=test_losses,
+                    test_labels=test_labels,
+                    test_preds=test_preds,
+                    parameters_history=parameters_history,
+                    num_classes=10,
+                    is_last_epoch=(epoch == args.epochs - 1),
                 )
-            fh_log.write(
-                f"Digit encoding epoch {epoch}: "
-                f"mean_margin={np.mean(list(encoding_summary['per_digit_mean_logit_margin'].values())):.4f}\n"
-            )
-            fh_log.flush()
-        except Exception as e:
-            tqdm.write(f"Warning: Failed to generate digit encoding analysis at epoch {epoch}: {e}")
+                if cm is not None:
+                    per_class_acc = cm.diagonal() / (cm.sum(axis=1) + 1e-10)
+                    per_class_acc_dict = {f"digit_{i}": f"{acc*100:.2f}%" for i, acc in enumerate(per_class_acc)}
+                    fh_log.write(f"Per-class accuracies: {per_class_acc_dict}\n")
+                    fh_log.flush()
+            except Exception as e:
+                tqdm.write(f"Warning: Failed to generate plots at epoch {epoch}: {e}")
+
+            try:
+                plot_signal_stages_for_example(
+                    model,
+                    example_inputs,
+                    ep_dir,
+                    epoch,
+                    input_mode="scalar",
+                    task_type="classification",
+                    class_labels=[str(i) for i in range(10)],
+                    true_label=example_label,
+                    num_units_plot=min(5, args.num_hidden),
+                    raw_input_label="pixel value",
+                    title_suffix=f"example digit: {example_label}",
+                )
+            except Exception as e:
+                tqdm.write(f"Warning: Failed to generate signal stage plots at epoch {epoch}: {e}")
+
+            try:
+                encoding_summary = plot_smnist_digit_encoding_analysis(
+                    model,
+                    digit_batches,
+                    ep_dir,
+                    epoch,
+                    num_units_plot=min(5, args.num_hidden),
+                    num_classes=10,
+                )
+                if not encoding_summary.get("dynamics_finite", True):
+                    tqdm.write(
+                        f"Warning: digit encoding at epoch {epoch} has non-finite dynamics/logits. "
+                        f"Check lambda_param (should be negative, e.g. -0.04)."
+                    )
+                fh_log.write(
+                    f"Digit encoding epoch {epoch}: "
+                    f"dominant={encoding_summary.get('dominant_encoding', 'n/a')}, "
+                    f"magnitude_score={encoding_summary.get('magnitude_separation_score', 0):.3f}, "
+                    f"phase_score={encoding_summary.get('phase_separation_score', 0):.3f}, "
+                    f"frequency_score={encoding_summary.get('frequency_separation_score', 0):.3f}\n"
+                )
+                fh_log.flush()
+            except Exception as e:
+                tqdm.write(f"Warning: Failed to generate digit encoding analysis at epoch {epoch}: {e}")
 
         metrics_file = f"{output_dir}/metrics.json"
         metrics_data = {
@@ -424,7 +432,7 @@ def run_training(omega_value, lambda_value=None, sweep_idx=None, sweep_type=None
         fh_log.flush()
         tqdm.write(msg)
 
-        if args.analyze_manifold:
+        if args.analyze_manifold and not args.skip_epoch_plots:
             try:
                 tqdm.write(f"\nRunning manifold dimension analysis at epoch {epoch}...")
                 manifold_results_epoch = analyze_manifold_dimension(
@@ -453,11 +461,11 @@ def run_training(omega_value, lambda_value=None, sweep_idx=None, sweep_type=None
     fh_log.write(msg + '\n')
     fh_log.flush()
     
-    if len(parameters_history) > 0:
+    if len(parameters_history) > 0 and not args.skip_epoch_plots:
         create_classification_gifs(output_dir)
     
     # final manifold dimension analysis
-    if args.analyze_manifold:
+    if args.analyze_manifold and not args.skip_epoch_plots:
         print("\n" + "=" * 60)
         print("Computing final manifold dimension analysis...")
         print("=" * 60 + "\n")

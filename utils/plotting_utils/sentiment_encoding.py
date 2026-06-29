@@ -1,7 +1,5 @@
-import json
 import os
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
@@ -11,7 +9,7 @@ from .signal_stages import (
     get_slon_core,
     prepare_imdb_sequence,
 )
-from .style import thesis_blue, thesis_red, ifisc_green
+from .style import thesis_red, ifisc_green
 
 
 def find_class_examples_batch(data_loader, labels=(0, 1), num_per_class=30, max_batches=100):
@@ -49,6 +47,7 @@ def trace_model_signal_stages_batch(model, inputs, input_mode="norm"):
     projected_inputs = []
     pre_activations = []
     z_real_trace = []
+    z_imag_trace = []
     z_mag_trace = []
 
     for t in range(num_timesteps):
@@ -61,6 +60,7 @@ def trace_model_signal_stages_batch(model, inputs, input_mode="norm"):
         projected_inputs.append(projected.detach().cpu())
         pre_activations.append(pre_act.detach().cpu())
         z_real_trace.append(z_real.detach().cpu())
+        z_imag_trace.append(z_imag.detach().cpu())
         z_mag_trace.append(torch.sqrt(z_real ** 2 + z_imag ** 2).detach().cpu())
 
     z_features = torch.cat([z_real, z_imag], dim=1)
@@ -75,6 +75,7 @@ def trace_model_signal_stages_batch(model, inputs, input_mode="norm"):
         "projected_input": torch.stack(projected_inputs).numpy(),
         "pre_activation": torch.stack(pre_activations).numpy(),
         "z_real": torch.stack(z_real_trace).numpy(),
+        "z_imag": torch.stack(z_imag_trace).numpy(),
         "z_magnitude": torch.stack(z_mag_trace).numpy(),
         "logits": logits.numpy(),
     }
@@ -120,7 +121,9 @@ def _example_features(stages, unit_indices):
     raw = stages["raw_input"]
     pre = _mean_over_units(stages["pre_activation"], unit_indices)
     z_real = _mean_over_units(stages["z_real"], unit_indices)
+    z_imag = _mean_over_units(stages["z_imag"], unit_indices)
     z_mag = _mean_over_units(stages["z_magnitude"], unit_indices)
+    z_phase = np.unwrap(np.arctan2(z_imag, z_real), axis=0)
     freqs = np.fft.rfftfreq(raw.shape[0], d=1.0)
 
     features = {
@@ -130,9 +133,15 @@ def _example_features(stages, unit_indices):
         "std_pre_activation": pre.std(axis=0),
         "mean_z_real": z_real.mean(axis=0),
         "std_z_real": z_real.std(axis=0),
+        "mean_z_imag": z_imag.mean(axis=0),
+        "std_z_imag": z_imag.std(axis=0),
+        "mean_z_phase": z_phase.mean(axis=0),
+        "std_z_phase": z_phase.std(axis=0),
         "mean_z_magnitude": z_mag.mean(axis=0),
         "std_z_magnitude": z_mag.std(axis=0),
         "final_z_real": z_real[-1],
+        "final_z_imag": z_imag[-1],
+        "final_z_phase": z_phase[-1],
         "final_z_magnitude": z_mag[-1],
         "max_z_magnitude": z_mag.max(axis=0),
         "logit_margin": _logit_margin(stages["logits"]),
@@ -143,6 +152,8 @@ def _example_features(stages, unit_indices):
         ("input", raw),
         ("pre_activation", pre),
         ("z_real", z_real),
+        ("z_imag", z_imag),
+        ("z_phase", z_phase),
         ("z_magnitude", z_mag),
     ]:
         amps = _rfft_amplitude(trace)
@@ -175,211 +186,96 @@ def plot_sentiment_encoding_analysis(
     epoch,
     num_units_plot=5,
 ):
+    from .signal_analysis import (
+        MAX_EXAMPLE_TIME_SERIES,
+        plot_autocorrelation_analysis,
+        plot_decision_drivers,
+        plot_granular_stage_spectra,
+        plot_phase_vs_magnitude_separation,
+        plot_real_imag_spectrum_comparison,
+        save_signal_analysis_summary,
+        _plot_example_time_series,
+    )
+    from .signal_stages import _unit_indices
+
     os.makedirs(output_dir, exist_ok=True)
 
-    num_timesteps = neg_stages["raw_input"].shape[0]
     num_nodes = neg_stages["pre_activation"].shape[-1]
     unit_indices = _unit_indices(num_nodes, num_units_plot)
-    freqs = np.fft.rfftfreq(num_timesteps, d=1.0)
+    groups = {0: neg_stages, 1: pos_stages}
+    colors = {0: thesis_red, 1: ifisc_green}
 
     neg_features = _example_features(neg_stages, unit_indices)
     pos_features = _example_features(pos_stages, unit_indices)
+    features_by_group = {0: neg_features, 1: pos_features}
 
-    fig, axes = plt.subplots(4, 2, figsize=(14, 16))
-    stage_specs = [
-        ("raw_input", "embedding norm", "input"),
-        ("pre_activation", r"pre-activation $u(t)$", "pre_activation"),
-        ("z_real", r"$\Re(z(t))$", "z_real"),
-        ("z_magnitude", r"$|z(t)|$", "z_magnitude"),
-    ]
-    for row, (key, ylabel, prefix) in enumerate(stage_specs):
-        neg_mean, neg_std = _mean_std_spectrum(neg_stages[key], unit_indices)
-        pos_mean, pos_std = _mean_std_spectrum(pos_stages[key], unit_indices)
-        _plot_mean_std_band(axes[row, 0], freqs, neg_mean, neg_std, thesis_red, "negative")
-        _plot_mean_std_band(axes[row, 0], freqs, pos_mean, pos_std, ifisc_green, "positive")
-        axes[row, 0].set_ylabel("amplitude")
-        axes[row, 0].set_title(f"{ylabel}: frequency spectrum")
-        axes[row, 0].legend(loc="upper right", fontsize=10)
-
-        diff = pos_mean - neg_mean
-        axes[row, 1].plot(freqs, diff, color=thesis_blue, linewidth=1.8)
-        axes[row, 1].axhline(0.0, color="0.5", linestyle="--", linewidth=0.8)
-        axes[row, 1].fill_between(freqs, 0.0, diff, where=diff >= 0, color=ifisc_green, alpha=0.2)
-        axes[row, 1].fill_between(freqs, 0.0, diff, where=diff < 0, color=thesis_red, alpha=0.2)
-        axes[row, 1].set_title(f"{ylabel}: spectral difference (pos $-$ neg)")
-        axes[row, 1].set_ylabel("amplitude diff")
-
-    axes[-1, 0].set_xlabel("frequency")
-    axes[-1, 1].set_xlabel("frequency")
-    plt.tight_layout()
-    fig.savefig(os.path.join(output_dir, _epoch_filename("sentiment_encoding_spectra", epoch)), transparent=True)
-    plt.close(fig)
-
-    fig2, axes2 = plt.subplots(3, 2, figsize=(14, 12), sharex=True)
-    t = np.arange(num_timesteps)
-    neg_raw_mean = neg_stages["raw_input"].mean(axis=1)
-    pos_raw_mean = pos_stages["raw_input"].mean(axis=1)
-    neg_raw_std = neg_stages["raw_input"].std(axis=1)
-    pos_raw_std = pos_stages["raw_input"].std(axis=1)
-
-    axes2[0, 0].plot(t, neg_raw_mean, color=thesis_red, linewidth=2.0, label="mean")
-    axes2[0, 0].fill_between(t, neg_raw_mean - neg_raw_std, neg_raw_mean + neg_raw_std, color=thesis_red, alpha=0.2)
-    axes2[0, 0].set_title("negative: input norm")
-    axes2[0, 0].set_ylabel("embedding norm")
-    axes2[0, 1].plot(t, pos_raw_mean, color=ifisc_green, linewidth=2.0)
-    axes2[0, 1].fill_between(t, pos_raw_mean - pos_raw_std, pos_raw_mean + pos_raw_std, color=ifisc_green, alpha=0.2)
-    axes2[0, 1].set_title("positive: input norm")
-
-    neg_zm = _mean_over_units(neg_stages["z_magnitude"], unit_indices)
-    pos_zm = _mean_over_units(pos_stages["z_magnitude"], unit_indices)
-    axes2[1, 0].plot(t, neg_zm.mean(axis=1), color=thesis_red, linewidth=2.0)
-    axes2[1, 0].fill_between(
-        t,
-        (neg_zm.mean(axis=1) - neg_zm.std(axis=1)),
-        (neg_zm.mean(axis=1) + neg_zm.std(axis=1)),
-        color=thesis_red,
-        alpha=0.2,
+    plot_granular_stage_spectra(
+        groups,
+        output_dir,
+        epoch,
+        prefix="sentiment",
+        unit_indices=unit_indices,
+        colors=colors,
+        title_suffix="sentiment encoding: spectra at each processing stage",
     )
-    axes2[1, 0].set_title("negative: $|z(t)|$")
-    axes2[1, 0].set_ylabel(r"$|z|$")
-    axes2[1, 1].plot(t, pos_zm.mean(axis=1), color=ifisc_green, linewidth=2.0)
-    axes2[1, 1].fill_between(
-        t,
-        (pos_zm.mean(axis=1) - pos_zm.std(axis=1)),
-        (pos_zm.mean(axis=1) + pos_zm.std(axis=1)),
-        color=ifisc_green,
-        alpha=0.2,
+    plot_real_imag_spectrum_comparison(groups, output_dir, epoch, "sentiment", unit_indices, colors)
+    plot_autocorrelation_analysis(
+        groups,
+        output_dir,
+        epoch,
+        prefix="sentiment",
+        unit_indices=unit_indices,
+        colors=colors,
+        title_suffix="sentiment encoding: temporal autocorrelation",
     )
-    axes2[1, 1].set_title("positive: $|z(t)|$")
 
-    neg_zr = _mean_over_units(neg_stages["z_real"], unit_indices)
-    pos_zr = _mean_over_units(pos_stages["z_real"], unit_indices)
-    axes2[2, 0].plot(t, neg_zr.mean(axis=1), color=thesis_red, linewidth=2.0)
-    axes2[2, 0].fill_between(
-        t,
-        (neg_zr.mean(axis=1) - neg_zr.std(axis=1)),
-        (neg_zr.mean(axis=1) + neg_zr.std(axis=1)),
-        color=thesis_red,
-        alpha=0.2,
+    n_examples = min(neg_stages["logits"].shape[0], pos_stages["logits"].shape[0])
+    if n_examples <= MAX_EXAMPLE_TIME_SERIES:
+        from .signal_stages import _epoch_filename
+        for stage_key, ylabel in [("z_real", r"$\Re(z)$"), ("z_imag", r"$\Im(z)$"), ("z_magnitude", r"$|z|$")]:
+            _plot_example_time_series(
+                groups,
+                stage_key,
+                ylabel,
+                os.path.join(output_dir, _epoch_filename(f"sentiment_examples_{stage_key.replace('z_', '')}", epoch)),
+                colors,
+                unit_indices,
+            )
+
+    separation_summary = plot_phase_vs_magnitude_separation(
+        features_by_group,
+        output_dir,
+        epoch,
+        prefix="sentiment",
+        compare_mode="binary",
+        reference_groups=(0, 1),
     )
-    axes2[2, 0].set_title("negative: $\Re(z)$ before readout")
-    axes2[2, 0].set_ylabel(r"$\Re(z)$")
-    axes2[2, 0].set_xlabel("time step")
-    axes2[2, 1].plot(t, pos_zr.mean(axis=1), color=ifisc_green, linewidth=2.0)
-    axes2[2, 1].fill_between(
-        t,
-        (pos_zr.mean(axis=1) - pos_zr.std(axis=1)),
-        (pos_zr.mean(axis=1) + pos_zr.std(axis=1)),
-        color=ifisc_green,
-        alpha=0.2,
+
+    plot_decision_drivers(
+        features_by_group,
+        output_dir,
+        epoch,
+        prefix="sentiment",
+        colors=colors,
+        ylabel="logit margin (pos $-$ neg)",
     )
-    axes2[2, 1].set_title("positive: $\Re(z)$ before readout")
-    axes2[2, 1].set_xlabel("time step")
-    plt.tight_layout()
-    fig2.savefig(os.path.join(output_dir, _epoch_filename("sentiment_encoding_magnitude", epoch)), transparent=True)
-    plt.close(fig2)
-
-    n_neg = neg_stages["logits"].shape[0]
-    n_pos = pos_stages["logits"].shape[0]
-    n_examples = min(n_neg, n_pos)
-    fig3, axes3 = plt.subplots(4, n_examples, figsize=(2.8 * n_examples, 10), sharex=True, squeeze=False)
-    row_specs = [
-        (neg_stages["raw_input"], thesis_red, "negative: input norm"),
-        (_mean_over_units(neg_stages["z_magnitude"], unit_indices), thesis_red, "negative: $|z(t)|$"),
-        (pos_stages["raw_input"], ifisc_green, "positive: input norm"),
-        (_mean_over_units(pos_stages["z_magnitude"], unit_indices), ifisc_green, "positive: $|z(t)|$"),
-    ]
-    for row, (data, color, row_title) in enumerate(row_specs):
-        for col in range(n_examples):
-            ax = axes3[row, col]
-            ax.plot(data[:, col], color=color, linewidth=1.3)
-            if col == 0:
-                ax.set_ylabel(row_title)
-            ax.set_title(f"example {col}")
-        axes3[row, -1].set_xlabel("time step")
-    plt.tight_layout()
-    fig3.savefig(os.path.join(output_dir, _epoch_filename("sentiment_encoding_examples", epoch)), transparent=True)
-    plt.close(fig3)
-
-    fig3b, axes3b = plt.subplots(2, n_examples, figsize=(2.8 * n_examples, 6), sharex=True, squeeze=False)
-    for col in range(n_examples):
-        axes3b[0, col].plot(_mean_over_units(neg_stages["z_real"], unit_indices)[:, col], color=thesis_red, linewidth=1.3)
-        axes3b[1, col].plot(_mean_over_units(pos_stages["z_real"], unit_indices)[:, col], color=ifisc_green, linewidth=1.3)
-        axes3b[0, col].set_title(f"negative ex. {col}")
-        axes3b[1, col].set_title(f"positive ex. {col}")
-        axes3b[1, col].set_xlabel("time step")
-    axes3b[0, 0].set_ylabel(r"$\Re(z)$ before readout")
-    axes3b[1, 0].set_ylabel(r"$\Re(z)$ before readout")
-    plt.tight_layout()
-    fig3b.savefig(os.path.join(output_dir, _epoch_filename("sentiment_encoding_zreal_examples", epoch)), transparent=True)
-    plt.close(fig3b)
-
-    fig4, axes4 = plt.subplots(2, 3, figsize=(15, 8))
-    scatter_specs = [
-        ("final_z_magnitude", "final $|z|$", axes4[0, 0]),
-        ("mean_z_magnitude", "mean $|z|$", axes4[0, 1]),
-        ("final_z_real", "final $\Re(z)$", axes4[0, 2]),
-        ("spectral_centroid_z_magnitude", "spectral centroid of $|z|$", axes4[1, 0]),
-        ("spectral_centroid_z_real", "spectral centroid of $\Re(z)$", axes4[1, 1]),
-        ("low_high_power_ratio_z_magnitude", "low/high power ratio of $|z|$", axes4[1, 2]),
-    ]
-    for key, xlabel, ax in scatter_specs:
-        ax.scatter(neg_features[key], neg_features["logit_margin"], color=thesis_red, alpha=0.8, label="negative")
-        ax.scatter(pos_features[key], pos_features["logit_margin"], color=ifisc_green, alpha=0.8, label="positive")
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel("logit margin (pos $-$ neg)")
-        ax.set_title(f"decision vs {xlabel}")
-        ax.legend(loc="best", fontsize=9)
-        ax.axhline(0.0, color="0.5", linestyle="--", linewidth=0.8)
-
-    plt.tight_layout()
-    fig4.savefig(os.path.join(output_dir, _epoch_filename("sentiment_encoding_decision_drivers", epoch)), transparent=True)
-    plt.close(fig4)
-
-    feature_names = list(neg_features.keys())
-    effect_sizes = {}
-    for name in feature_names:
-        effect_sizes[name] = _cohens_d(pos_features[name], neg_features[name])
-
-    ranked = sorted(effect_sizes.items(), key=lambda item: abs(item[1]), reverse=True)
-    top_names = [name for name, _ in ranked[:10]]
-    top_vals = [effect_sizes[name] for name in top_names]
-
-    fig5, ax5 = plt.subplots(figsize=(12, 6))
-    colors = [ifisc_green if v > 0 else thesis_red for v in top_vals]
-    ax5.barh(top_names[::-1], top_vals[::-1], color=colors[::-1], alpha=0.85)
-    ax5.axvline(0.0, color="0.4", linewidth=0.8)
-    ax5.set_xlabel("Cohen's $d$ (positive $-$ negative)")
-    ax5.set_title("which signal properties separate sentiment?")
-    plt.tight_layout()
-    fig5.savefig(os.path.join(output_dir, _epoch_filename("sentiment_encoding_separation", epoch)), transparent=True)
-    plt.close(fig5)
-
-    magnitude_keys = [k for k in effect_sizes if "magnitude" in k or "z_real" in k or "input_norm" in k]
-    frequency_keys = [k for k in effect_sizes if "spectral" in k or "power_ratio" in k]
-    magnitude_score = float(np.mean([abs(effect_sizes[k]) for k in magnitude_keys])) if magnitude_keys else 0.0
-    frequency_score = float(np.mean([abs(effect_sizes[k]) for k in frequency_keys])) if frequency_keys else 0.0
 
     summary = {
         "num_negative_examples": int(neg_stages["logits"].shape[0]),
         "num_positive_examples": int(pos_stages["logits"].shape[0]),
-        "effect_sizes": {k: float(v) for k, v in effect_sizes.items()},
-        "top_separating_features": [{"feature": n, "cohens_d": float(effect_sizes[n])} for n, _ in ranked[:5]],
-        "magnitude_separation_score": magnitude_score,
-        "frequency_separation_score": frequency_score,
-        "dominant_encoding": (
-            "magnitude" if magnitude_score >= frequency_score else "frequency"
-        ),
         "negative_mean_logit_margin": float(np.mean(neg_features["logit_margin"])),
         "positive_mean_logit_margin": float(np.mean(pos_features["logit_margin"])),
         "negative_mean_final_z_magnitude": float(np.mean(neg_features["final_z_magnitude"])),
         "positive_mean_final_z_magnitude": float(np.mean(pos_features["final_z_magnitude"])),
-        "negative_mean_spectral_centroid_z": float(np.mean(neg_features["spectral_centroid_z_magnitude"])),
-        "positive_mean_spectral_centroid_z": float(np.mean(pos_features["spectral_centroid_z_magnitude"])),
+        "negative_mean_final_z_imag": float(np.mean(neg_features["final_z_imag"])),
+        "positive_mean_final_z_imag": float(np.mean(pos_features["final_z_imag"])),
+        "negative_mean_spectral_centroid_z_magnitude": float(np.mean(neg_features["spectral_centroid_z_magnitude"])),
+        "positive_mean_spectral_centroid_z_magnitude": float(np.mean(pos_features["spectral_centroid_z_magnitude"])),
+        "negative_mean_spectral_centroid_z_imag": float(np.mean(neg_features["spectral_centroid_z_imag"])),
+        "positive_mean_spectral_centroid_z_imag": float(np.mean(pos_features["spectral_centroid_z_imag"])),
+        **separation_summary,
     }
-    with open(os.path.join(output_dir, _epoch_filename("sentiment_encoding_summary", epoch, suffix="json")), "w") as f:
-        json.dump(summary, f, indent=2)
-    return summary
+    return save_signal_analysis_summary(summary, output_dir, epoch, "sentiment")
 
 
 @torch.no_grad()

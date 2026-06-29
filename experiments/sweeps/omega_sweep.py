@@ -43,11 +43,11 @@ TASKS: dict[str, TaskConfig] = {
         name="IMDB",
         script="training/train_imdb.py",
         output_glob="results/imdb/*",
-        metric_label="test accuracy (%)",
+        metric_label=r"test accuracy ($\%$)",
         omega_center=0.035904,
-        omega_min=0.0,
-        omega_max=1.0,
-        omega_step=0.1,
+        omega_min=1.0,
+        omega_max=10.0,
+        omega_step=1,
         base_cmd=[
             sys.executable,
             "training/train_imdb.py",
@@ -61,13 +61,14 @@ TASKS: dict[str, TaskConfig] = {
             "--lambda-param", "-0.05",
             "--gamma-real", "-0.1",
             "--gamma-imag", "0.1",
+            "--skip-epoch-plots",
         ],
     ),
     "smnist": TaskConfig(
         name="sMNIST",
         script="training/train_smnist.py",
         output_glob="results/smnist/*",
-        metric_label="test accuracy (%)",
+        metric_label=r"test accuracy ($\%$)",
         omega_center=0.224,
         omega_min=0.0,
         omega_max=1.0,
@@ -80,6 +81,7 @@ TASKS: dict[str, TaskConfig] = {
             "--gamma-imag", "0.0",
             "--epochs", "10",
             "--num-hidden", "128",
+            "--skip-epoch-plots",
         ],
     ),
     "mackey_glass": TaskConfig(
@@ -111,6 +113,7 @@ TASKS: dict[str, TaskConfig] = {
             "--seed", "1",
             "--lr-decay-power", "1.0",
             "--min-lr-ratio", "0.0",
+            "--skip-epoch-plots",
         ],
     ),
 }
@@ -389,14 +392,18 @@ def plot_results(results: dict, plot_path: Path) -> None:
         ax.axvline(task.omega_center, color=color, linestyle="--", alpha=0.5, linewidth=1)
 
         n_runs = summary[0]["n_runs"]
-        ax.set_title(f"{task.name}\n({n_runs} runs per $\\omega$)")
+        # ax.set_title(f"{task.name}\n({n_runs} runs per $\\omega$)")
         ax.set_ylabel(task.metric_label)
-        ax.set_xlabel(r"$\omega$ (natural frequency)")
+        ax.set_xlabel(r"$\omega$")
         ax.grid(True, alpha=0.3)
+        if task_key == "mackey_glass":
+            ax.set_ylim(0.0, 1.0)
+        else:
+            ax.set_ylim(50.0, 100.0)
 
     handles = [
         plt.Line2D([0], [0], color="gray", linewidth=2, marker="o", label="mean"),
-        plt.Rectangle((0, 0), 1, 1, facecolor="gray", alpha=0.25, label="95% CI"),
+        plt.Rectangle((0, 0), 1, 1, facecolor="gray", alpha=0.25, label="$95\%$ CI"),
         plt.Rectangle((0, 0), 1, 1, facecolor="gray", alpha=0.15, label=r"$\pm 1\sigma$"),
     ]
     fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 1.08), ncol=3, frameon=False)
@@ -479,7 +486,7 @@ def main() -> None:
 
     if args.with_manifold:
         for task in TASKS.values():
-            task.base_cmd = [c for c in task.base_cmd if c != "--no-analyze-manifold"]
+            task.base_cmd = [c for c in task.base_cmd if c != "--skip-epoch-plots"]
 
     if not args.plot_only:
         task_grids = {
