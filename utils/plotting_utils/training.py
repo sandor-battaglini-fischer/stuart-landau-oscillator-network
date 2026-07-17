@@ -173,6 +173,18 @@ def create_classification_gifs(output_dir):
         "digit_real_imag_spectra.gif",
         target_size=(1400, 800),
     )
+    create_gif_from_epoch_dirs(
+        output_dir,
+        "digit_node_activity_magnitude_epoch*.png",
+        "digit_node_activity_magnitude.gif",
+        target_size=(1300, 900),
+    )
+    create_gif_from_epoch_dirs(
+        output_dir,
+        "digit_node_spectrum_magnitude_epoch*.png",
+        "digit_node_spectrum_magnitude.gif",
+        target_size=(1300, 900),
+    )
 
 
 def plot_mackey_glass_snapshots(

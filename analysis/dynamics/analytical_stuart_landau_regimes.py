@@ -64,9 +64,15 @@ cases = [
 
 omega, gi = 4.0, 0.0
 
+def limit_cycle_radius(lam, gr, eps=1e-9):
+    if lam * gr < -eps:
+        return np.sqrt(-lam / gr)
+    return None
+
+
 for lam, gr, r0, anchor in cases:
     T = 18 if (lam > 0 and gr > 0) else 25
-    t, xs = simulate(lam, omega, gr, gi, r0, T=T)
+    _, xs = simulate(lam, omega, gr, gi, r0, T=T)
     inax = inset_axes(
         ax,
         INSET_W_IN,
@@ -76,12 +82,35 @@ for lam, gr, r0, anchor in cases:
         bbox_transform=ax.transData,
         borderpad=0,
     )
-    inax.plot(t, xs.real, 'k-', lw=0.7)
-    inax.set_xlim(0, T)
-    real = xs.real[np.isfinite(xs.real)]
-    if len(real) > 0:
-        ymax = max(abs(real.min()), abs(real.max()), 0.2) * 1.3
-        inax.set_ylim(-ymax, ymax)
+    finite = np.isfinite(xs.real) & np.isfinite(xs.imag)
+    inax.plot(xs.real[finite], xs.imag[finite], 'k-', lw=0.7)
+    inax.plot(xs.real[0], xs.imag[0], 'ko', ms=2.2, mew=0.5)
+    inax.plot(0, 0, 'k+', ms=5, mew=0.6)
+
+    r_lc = limit_cycle_radius(lam, gr)
+    if r_lc is not None:
+        theta = np.linspace(0, 2 * np.pi, 200)
+        inax.plot(
+            r_lc * np.cos(theta),
+            r_lc * np.sin(theta),
+            'k--',
+            lw=0.45,
+            alpha=0.55,
+        )
+
+    re = xs.real[finite]
+    im = xs.imag[finite]
+    if len(re) > 0:
+        rmax = max(
+            np.max(np.abs(re)),
+            np.max(np.abs(im)),
+            r_lc or 0.0,
+            abs(r0),
+            0.2,
+        ) * 1.2
+        inax.set_xlim(-rmax, rmax)
+        inax.set_ylim(-rmax, rmax)
+    inax.set_aspect('equal', adjustable='box')
     inax.set_xticks([])
     inax.set_yticks([])
     inax.set_facecolor('white')
@@ -89,7 +118,13 @@ for lam, gr, r0, anchor in cases:
         sp.set_linewidth(0.6)
         sp.set_color('0.4')
     inax.axhline(0, color='0.7', lw=0.45)
+    inax.axvline(0, color='0.7', lw=0.45)
 
 fig.subplots_adjust(left=0.11, right=0.97, top=0.90, bottom=0.10)
-fig.savefig('regime_diagram.png', dpi=400)
+import os
+save_path = 'results/dynamics/regime_diagram_state_space.png'
+save_dir = os.path.dirname(save_path)
+if not os.path.exists(save_dir):
+    os.makedirs(save_dir, exist_ok=True)
+fig.savefig(save_path, dpi=400)
 plt.show()

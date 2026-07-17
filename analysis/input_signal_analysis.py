@@ -21,9 +21,10 @@ apply_style()
 
 mg_cmap = mcolors.LinearSegmentedColormap.from_list("mg_cmap", [(0.5, 0.6, 0.0), ifisc_green])
 
-from training.train_mackey_glass import MackeyGlassDataset, generate_mackey_glass
-from models import SLON as HORN_SL
-from models import SLON as HORN_DHO
+from training.train_mackey_glass import MackeyGlassDataset, generate_mackey_glass, build_dataloaders
+from models import SLON, HORN
+from utils.model_factory import build_oscillator
+from utils.plotting_utils.mackey_glass_encoding import plot_mackey_glass_encoding_analysis_from_loader
 from training.train_imdb import (
     tokenize,
     Vocabulary,
@@ -35,6 +36,35 @@ from training.train_imdb import (
     load_glove_vectors,
     SLONWithEmbedding,
 )
+
+# TASK_COLORS = {
+#     "smnist": ifisc_green,
+#     "imdb": thesis_blue,
+#     "mackey_glass": thesis_red,
+# }
+
+TASK_COLORS = {
+    "smnist": "black",
+    "imdb": "black",
+    "mackey_glass": "black",
+}
+
+
+def resolve_output_dir(prefix, output_dir=None):
+    if output_dir is not None:
+        path = os.path.abspath(output_dir)
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(PROJECT_ROOT, "results", "input_analysis", f"{prefix}_{timestamp}")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _ylim_with_margin(*arrays):
+    values = np.concatenate([np.asarray(a).ravel() for a in arrays])
+    y_min, y_max = float(values.min()), float(values.max())
+    margin = (y_max - y_min) * 0.05 if y_max > y_min else 0.05
+    return y_min - margin, y_max + margin
 
 
 def compute_pre_activations_stuart_landau(model, inputs, random_init=None):
@@ -56,12 +86,18 @@ def compute_pre_activations_stuart_landau(model, inputs, random_init=None):
         input_t = inputs[t]
         z_state = torch.cat([z_real, z_imag], dim=1)
         pre_act = model.i2h(input_t) + model.gain_rec * model.h2h(z_state)
-        input_force = model.alpha * torch.tanh(pre_act)
+        if model.use_tanh:
+            input_force = model.alpha * torch.tanh(pre_act)
+        else:
+            input_force = model.alpha * pre_act
 
         z = torch.complex(z_real, z_imag)
-        dz_dt = lambda_omega_coeff * z + gamma_coeff * torch.abs(z) ** 2 * z + torch.complex(
-            input_force, torch.zeros_like(input_force)
-        )
+        if model.linear_dynamics:
+            dz_dt = lambda_omega_coeff * z + torch.complex(input_force, torch.zeros_like(input_force))
+        else:
+            dz_dt = lambda_omega_coeff * z + gamma_coeff * torch.abs(z) ** 2 * z + torch.complex(
+                input_force, torch.zeros_like(input_force)
+            )
         z = z + model.h * dz_dt
         z_real = torch.real(z)
         z_imag = torch.imag(z)
@@ -70,6 +106,33 @@ def compute_pre_activations_stuart_landau(model, inputs, random_init=None):
 
     pre_acts = torch.stack(pre_acts, dim=0)
     return pre_acts
+
+
+def compute_pre_activations_horn(model, inputs, random_init=None):
+    num_timesteps, batch_size, _ = inputs.shape
+
+    if random_init is not None:
+        x_t = torch.randn(batch_size, model.num_nodes) * random_init
+        y_t = torch.randn(batch_size, model.num_nodes) * random_init
+    else:
+        x_t = torch.zeros(batch_size, model.num_nodes)
+        y_t = torch.zeros(batch_size, model.num_nodes)
+
+    pre_acts = []
+
+    for t in range(num_timesteps):
+        input_t = inputs[t]
+        pre_act = model.i2h(input_t) + model.gain_rec * model.h2h(y_t)
+        x_t, y_t = model.dynamics_step(x_t, y_t, input_t)
+        pre_acts.append(pre_act.detach().cpu())
+
+    return torch.stack(pre_acts, dim=0)
+
+
+def compute_pre_activations(model, inputs, random_init=None):
+    if isinstance(model, HORN):
+        return compute_pre_activations_horn(model, inputs, random_init=random_init)
+    return compute_pre_activations_stuart_landau(model, inputs, random_init=random_init)
 
 
 def simulate_stuart_landau_base(lambda_param, omega, gamma_real, gamma_imag, h, num_steps, z0=None):
@@ -157,23 +220,19 @@ def get_smnist_pre_acts(args, model=None, return_model=False):
     dim_output = 10
 
     if model is None:
-        dynamics_cls = HORN_SL if args.dynamics == "sl" else HORN_DHO
-
-        if args.dynamics == "sl":
-            model = dynamics_cls(
-                dim_input,
-                args.num_hidden,
-                dim_output,
-                args.h,
-                args.alpha,
-                args.omega,
-                args.gamma,
-                lambda_param=args.lambda_param,
-                gamma_real=args.gamma_real,
-                gamma_imag=args.gamma_imag,
-            )
-        else:
-            model = dynamics_cls(dim_input, args.num_hidden, dim_output, args.h, args.alpha, args.omega, args.gamma)
+        model = build_oscillator(
+            args.dynamics,
+            dim_input,
+            args.num_hidden,
+            dim_output,
+            args.h,
+            args.alpha,
+            args.omega,
+            args.gamma,
+            lambda_param=args.lambda_param,
+            gamma_real=args.gamma_real,
+            gamma_imag=args.gamma_imag,
+        )
 
         if args.checkpoint is not None and os.path.isfile(args.checkpoint):
             state = torch.load(args.checkpoint, map_location="cpu")
@@ -197,7 +256,7 @@ def get_smnist_pre_acts(args, model=None, return_model=False):
         perm = torch.randperm(images.size(0))
         images = images[perm, :, :]
 
-    pre_acts = compute_pre_activations_stuart_landau(model, images, random_init=args.random_init)
+    pre_acts = compute_pre_activations(model, images, random_init=args.random_init)
     pixel_trace = images[:, 0, 0].detach().cpu().numpy()
     if return_model:
         return pre_acts, pixel_trace, model
@@ -324,10 +383,10 @@ def get_imdb_pre_acts(args, model=None, vocab=None, return_model=False):
             pad_idx,
             dropout=args.dropout,
             embedding_weights=embedding_weights,
-            dynamics=args.dynamics,
             lambda_param=args.lambda_param,
             gamma_real=args.gamma_real,
             gamma_imag=args.gamma_imag,
+            dynamics=args.dynamics,
         )
 
         if args.checkpoint is not None and os.path.isfile(args.checkpoint):
@@ -347,7 +406,7 @@ def get_imdb_pre_acts(args, model=None, vocab=None, return_model=False):
 
     embedded = embedded.permute(1, 0, 2)
 
-    pre_acts = compute_pre_activations_stuart_landau(model.horn, embedded, random_init=args.random_init)
+    pre_acts = compute_pre_activations(model.slon, embedded, random_init=args.random_init)
     embed_mag_trace = embedded[:, 0, :].norm(dim=-1).detach().cpu().numpy()
     if return_model:
         return pre_acts, embed_mag_trace, model, vocab
@@ -374,6 +433,7 @@ def plot_mackey_glass_with_discretization(
     horizon,
     input_scale=1.0,
     sample_step=1,
+    color=thesis_blue,
 ):
     scaled_series = series * input_scale
     window_indices = np.unique(series_indices.astype(np.int64))
@@ -384,14 +444,14 @@ def plot_mackey_glass_with_discretization(
     ax.plot(
         view_indices,
         scaled_series[view_indices],
-        color=thesis_blue,
+        color=color,
         alpha=0.25,
         linewidth=0.5,
     )
     ax.scatter(
         view_indices,
         scaled_series[view_indices],
-        color=thesis_blue,
+        color=color,
         s=12,
         alpha=0.5,
         label="samples",
@@ -401,7 +461,7 @@ def plot_mackey_glass_with_discretization(
         series_indices,
         mg_trace,
         label="Input",
-        color=thesis_blue,
+        color=color,
         linewidth=1.5,
         zorder=4,
     )
@@ -414,23 +474,19 @@ def get_mg_pre_acts(args, model=None, series=None, return_model=False):
     dim_output = 1
 
     if model is None:
-        dynamics_cls = HORN_SL if args.dynamics == "sl" else HORN_DHO
-
-        if args.dynamics == "sl":
-            model = dynamics_cls(
-                dim_input,
-                args.num_hidden,
-                dim_output,
-                args.h,
-                args.alpha,
-                args.omega,
-                args.gamma,
-                lambda_param=args.lambda_param,
-                gamma_real=args.gamma_real,
-                gamma_imag=args.gamma_imag,
-            )
-        else:
-            model = dynamics_cls(dim_input, args.num_hidden, dim_output, args.h, args.alpha, args.omega, args.gamma)
+        model = build_oscillator(
+            args.dynamics,
+            dim_input,
+            args.num_hidden,
+            dim_output,
+            args.h,
+            args.alpha,
+            args.omega,
+            args.gamma,
+            lambda_param=args.lambda_param,
+            gamma_real=args.gamma_real,
+            gamma_imag=args.gamma_imag,
+        )
 
         if args.checkpoint is not None and os.path.isfile(args.checkpoint):
             state = torch.load(args.checkpoint, map_location="cpu")
@@ -454,7 +510,7 @@ def get_mg_pre_acts(args, model=None, series=None, return_model=False):
     inputs = inputs * args.mg_input_scale
     inputs = inputs.permute(1, 0, 2)
 
-    pre_acts = compute_pre_activations_stuart_landau(model, inputs, random_init=args.random_init)
+    pre_acts = compute_pre_activations(model, inputs, random_init=args.random_init)
     mg_trace = inputs[:, 0, 0].detach().cpu().numpy()
     series_indices = mg_series_indices_for_sample(dataset, last_sampled_idxs[0].item())
     if return_model:
@@ -464,8 +520,7 @@ def get_mg_pre_acts(args, model=None, series=None, return_model=False):
 
 def analyze_smnist(args):
     pre_acts, pixel_trace = get_smnist_pre_acts(args)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.join("input_analysis", f"smnist_{timestamp}")
+    output_dir = resolve_output_dir("smnist", getattr(args, "output_dir", None))
     plot_single_example_time_series(pre_acts, output_dir, prefix="smnist", num_units=args.num_units_plot, example_idx=0)
 
     t = np.arange(pixel_trace.shape[0])
@@ -480,8 +535,7 @@ def analyze_smnist(args):
 
 def analyze_imdb(args):
     pre_acts, embed_mag_trace = get_imdb_pre_acts(args)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.join("input_analysis", f"imdb_{timestamp}")
+    output_dir = resolve_output_dir("imdb", getattr(args, "output_dir", None))
     plot_single_example_time_series(pre_acts, output_dir, prefix="imdb", num_units=args.num_units_plot, example_idx=0)
 
     t = np.arange(embed_mag_trace.shape[0])
@@ -495,9 +549,8 @@ def analyze_imdb(args):
 
 
 def analyze_mg(args):
-    pre_acts, mg_trace, series_indices, _, series = get_mg_pre_acts(args, return_model=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.join("input_analysis", f"mg_{timestamp}")
+    pre_acts, mg_trace, series_indices, model, series = get_mg_pre_acts(args, return_model=True)
+    output_dir = resolve_output_dir("mg", getattr(args, "output_dir", None))
     plot_single_example_time_series(pre_acts, output_dir, prefix="mg", num_units=args.num_units_plot, example_idx=0)
 
     plt.figure(figsize=(10, 4))
@@ -517,7 +570,34 @@ def analyze_mg(args):
     plt.savefig(os.path.join(output_dir, "mg_single_example_raw_input.png"), transparent=True)
     plt.close()
 
-
+    if args.checkpoint is not None and os.path.isfile(args.checkpoint):
+        _, _, test_loader, _, _, _ = build_dataloaders(
+            series_length=args.mg_series_length,
+            input_length=args.mg_input_length,
+            horizon=args.mg_horizon,
+            batch_size=args.batch_size,
+            val_fraction=getattr(args, "val_fraction", 0.1),
+            test_fraction=getattr(args, "test_fraction", 0.1),
+            tau=args.mg_tau,
+            delta_t=args.mg_delta_t,
+            beta=args.mg_beta,
+            gamma_mg=args.mg_gamma,
+            n=args.mg_n,
+            x0=args.mg_x0,
+            seed=args.seed,
+            remove_top_n_freqs=0,
+        )
+        tau_steps = int(args.mg_tau / args.mg_delta_t)
+        plot_mackey_glass_encoding_analysis_from_loader(
+            model,
+            test_loader,
+            output_dir,
+            epoch=None,
+            grouping=getattr(args, "encoding_grouping", "all"),
+            num_per_group=max(1, getattr(args, "encoding_analysis_examples", 50) // 2),
+            num_units_plot=args.num_units_plot,
+            tau_steps=tau_steps,
+        )
 
 def analyze_compare(args):
     use_sm = getattr(args, "use_sm", False)
@@ -684,36 +764,15 @@ def analyze_compare(args):
     im_series = pre_acts_imdb[:, 0, 0].numpy() if use_im else None
     mg_series_list = [pre_acts_mg[:, 0, 0].numpy() for pre_acts_mg in mg_pre_acts_list] if use_mg else []
 
-    t_sm = np.arange(sm_series.shape[0]) if use_sm else None
-    t_im = np.arange(im_series.shape[0]) if use_im else None
-    t_mg = np.arange(mg_series_list[0].shape[0]) if use_mg else None
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.join("input_analysis", f"compare_{timestamp}")
-    os.makedirs(output_dir, exist_ok=True)
-
-    lambda_sm = sm_lambda
-    omega_sm = sm_omega
-    gamma_real_sm = sm_gamma_real
-    gamma_imag_sm = sm_gamma_imag
-
-    lambda_im = im_lambda
-    omega_im = omega_imdb
-    gamma_real_im = im_gamma_real
-    gamma_imag_im = im_gamma_imag
-
-    lambda_mg_list = mg_lambdas
-    omega_mg_list = mg_omegas
-    gamma_real_mg_list = mg_gamma_reals
-    gamma_imag_mg_list = mg_gamma_imags
+    output_dir = resolve_output_dir("compare", getattr(args, "output_dir", None))
 
     base_sm = None
     if use_sm:
         base_sm = simulate_stuart_landau_base(
-            lambda_param=lambda_sm,
-            omega=omega_sm,
-            gamma_real=gamma_real_sm,
-            gamma_imag=gamma_imag_sm,
+            lambda_param=sm_lambda,
+            omega=sm_omega,
+            gamma_real=sm_gamma_real,
+            gamma_imag=sm_gamma_imag,
             h=args.h,
             num_steps=sm_series.shape[0],
         )
@@ -721,10 +780,10 @@ def analyze_compare(args):
     base_im = None
     if use_im:
         base_im = simulate_stuart_landau_base(
-            lambda_param=lambda_im,
-            omega=omega_im,
-            gamma_real=gamma_real_im,
-            gamma_imag=gamma_imag_im,
+            lambda_param=im_lambda,
+            omega=omega_imdb,
+            gamma_real=im_gamma_real,
+            gamma_imag=im_gamma_imag,
             h=args.h,
             num_steps=im_series.shape[0],
         )
@@ -732,7 +791,7 @@ def analyze_compare(args):
     base_mg_list = []
     if use_mg:
         for lam, omg, g_re, g_im, mg_series in zip(
-            lambda_mg_list, omega_mg_list, gamma_real_mg_list, gamma_imag_mg_list, mg_series_list
+            mg_lambdas, mg_omegas, mg_gamma_reals, mg_gamma_imags, mg_series_list
         ):
             base_mg = simulate_stuart_landau_base(
                 lambda_param=lam,
@@ -747,86 +806,63 @@ def analyze_compare(args):
     t_sm_raw = np.arange(pixel_trace.shape[0]) if use_sm else None
     t_im_raw = np.arange(embed_mag_trace.shape[0]) if use_im else None
 
-    plt.rcParams.update({'font.size': 32})
-
-    if use_sm:
-        fig, ax = plt.subplots(1, 1, figsize=(12, 6))
-        all_values = [pixel_trace.min(), pixel_trace.max(), base_sm.min(), base_sm.max()]
-        y_min, y_max = min(all_values), max(all_values)
-        y_margin = (y_max - y_min) * 0.05
-        y_lim = [y_min - y_margin, y_max + y_margin]
-        
-        ax.plot(t_sm_raw, pixel_trace, label="Input", color=thesis_blue, linewidth=1.5)
-        # ax.plot(t_sm, base_sm, label="Oscillation", color=ifisc_green, linewidth=2.0)
-        for x in range(28, t_sm_raw[-1] + 1, 28):
-            ax.axvline(x=x, color=thesis_blue, alpha=0.2, linewidth=0.8)
-        ax.set_title(rf"sMNIST ($\lambda={lambda_sm:.3f}$, $\omega={omega_sm:.3f}$, $\Re\gamma={gamma_real_sm:.3f}$, $\Im\gamma={gamma_imag_sm:.3f}$)", fontsize=24)
-        ax.set_ylabel(r"Input value", fontsize=28)
-        ax.set_xlabel("Time step", fontsize=28)
-        ax.set_ylim(y_lim)
-        ax.legend(loc="center right", fontsize=24)
-        ax.grid(True, alpha=0.3)
-        ax.tick_params(labelsize=32)
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, "smnist_input.png"), transparent=True, dpi=300)
-        plt.close()
-
+    panels = []
     if use_im:
-        fig, ax = plt.subplots(1, 1, figsize=(12, 6))
-        all_values = [embed_mag_trace.min(), embed_mag_trace.max(), base_im.min(), base_im.max()]
-        y_min, y_max = min(all_values), max(all_values)
-        y_margin = (y_max - y_min) * 0.05
-        y_lim = [y_min - y_margin, y_max + y_margin]
-        
-        ax.plot(t_im_raw, embed_mag_trace, label="Input", color=thesis_blue, linewidth=1.5)
-        # ax.plot(t_im, base_im, label="Oscillation", color=ifisc_green, linewidth=2.0)
-        ax.set_title(rf"IMDB ($\lambda={lambda_im:.3f}$, $\omega={omega_im:.3f}$, $\Re\gamma={gamma_real_im:.3f}$, $\Im\gamma={gamma_imag_im:.3f}$)", fontsize=24)
-        ax.set_ylabel(r"Input value", fontsize=28)
-        ax.set_xlabel("Time step", fontsize=28)
-        ax.set_ylim(y_lim)
-        ax.legend(loc="center right", fontsize=24)
-        ax.grid(True, alpha=0.3)
-        ax.tick_params(labelsize=32)
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, "imdb_input.png"), transparent=True, dpi=300)
-        plt.close()
-
+        panels.append("im")
+    if use_sm:
+        panels.append("sm")
     if use_mg:
-        mg_trace = mg_trace_list[0]
-        series_mg = series_mg_list[0]
-        series_indices = mg_series_indices_list[0]
-        base_mg = base_mg_list[0]
-        lam = lambda_mg_list[0]
-        omg = omega_mg_list[0]
-        g_re = gamma_real_mg_list[0]
-        g_im = gamma_imag_mg_list[0]
-        inp_scale = mg_input_scales[0]
+        panels.append("mg")
 
-        fig, ax = plt.subplots(1, 1, figsize=(12, 6))
-        plot_mackey_glass_with_discretization(
-            ax,
-            series_mg,
-            mg_trace,
-            series_indices,
-            args.mg_input_length,
-            args.mg_horizon,
-            input_scale=inp_scale,
-        )
-        all_values = [mg_trace.min(), mg_trace.max(), base_mg.min(), base_mg.max()]
-        y_min, y_max = min(all_values), max(all_values)
-        y_margin = (y_max - y_min) * 0.05
-        y_lim = [y_min - y_margin, y_max + y_margin]
+    n_tasks = len(panels)
+    fig, axes = plt.subplots(n_tasks, 1, figsize=(7, 3.2 * n_tasks))
+    if n_tasks == 1:
+        axes = [axes]
 
-        ax.set_title(rf"Mackey-Glass ($\lambda={lam:.3f}$, $\omega={omg:.3f}$, $\Re\gamma={g_re:.3f}$, $\Im\gamma={g_im:.3f}$)", fontsize=24)
-        ax.set_ylabel(r"Input value", fontsize=28)
-        ax.set_xlabel("Time step", fontsize=28)
-        ax.set_ylim(y_lim)
-        ax.legend(loc="center right", fontsize=24)
-        ax.grid(True, alpha=0.3)
-        ax.tick_params(labelsize=32)
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, "mackey_glass_input.png"), transparent=True, dpi=300)
-        plt.close()
+    for ax, panel in zip(axes, panels):
+        if panel == "sm":
+            color = TASK_COLORS["smnist"]
+            ax.plot(t_sm_raw, pixel_trace, color=color, linewidth=1.5, label="Input")
+            for x in range(28, int(t_sm_raw[-1]) + 1, 28):
+                ax.axvline(x=x, color=color, alpha=0.2, linewidth=0.8)
+            ax.set_ylim(_ylim_with_margin(pixel_trace, base_sm))
+            ax.set_title("sMNIST", loc="left")
+        elif panel == "im":
+            color = TASK_COLORS["imdb"]
+            ax.plot(t_im_raw, embed_mag_trace, color=color, linewidth=1.5, label="Input")
+            ax.set_ylim(_ylim_with_margin(embed_mag_trace, base_im))
+            ax.set_title("IMDB", loc="left")
+        elif panel == "mg":
+            color = TASK_COLORS["mackey_glass"]
+            mg_trace = mg_trace_list[0]
+            series_mg = series_mg_list[0]
+            series_indices = mg_series_indices_list[0]
+            base_mg = base_mg_list[0]
+            inp_scale = mg_input_scales[0]
+            plot_mackey_glass_with_discretization(
+                ax,
+                series_mg,
+                mg_trace,
+                series_indices,
+                args.mg_input_length,
+                args.mg_horizon,
+                input_scale=inp_scale,
+                color=color,
+            )
+            ax.set_ylim(_ylim_with_margin(mg_trace, base_mg))
+            ax.set_title("Mackey-Glass", loc="left")
+        ax.set_ylabel("Input value")
+        ax.legend(loc="lower right", fontsize=14)
+
+    for ax in axes[:-1]:
+        ax.set_xlabel("")
+    axes[-1].set_xlabel("Time step")
+    fig.suptitle("Input signals", y=1.02)
+    fig.tight_layout()
+    plot_path = os.path.join(output_dir, "input_signals.png")
+    fig.savefig(plot_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved plot: {plot_path}")
 
 
 def main():
@@ -834,7 +870,7 @@ def main():
     subparsers = parser.add_subparsers(dest="dataset", required=True)
 
     smnist_parser = subparsers.add_parser("smnist", help="Analyze sMNIST input")
-    smnist_parser.add_argument("--dynamics", type=str, default="sl", choices=["dho", "sl"])
+    smnist_parser.add_argument("--dynamics", type=str, default="sl", choices=["sl", "lo", "dho"])
     smnist_parser.add_argument("--num-hidden", type=int, default=50)
     smnist_parser.add_argument("--batch-size", type=int, default=64)
     smnist_parser.add_argument("--seed", type=int, default=1)
@@ -850,7 +886,7 @@ def main():
     smnist_parser.add_argument("--num-units-plot", type=int, default=5)
 
     imdb_parser = subparsers.add_parser("imdb", help="Analyze IMDB input")
-    imdb_parser.add_argument("--dynamics", type=str, default="sl", choices=["dho", "sl"])
+    imdb_parser.add_argument("--dynamics", type=str, default="sl", choices=["sl", "lo", "dho"])
     imdb_parser.add_argument("--num-hidden", type=int, default=9)
     imdb_parser.add_argument("--batch-size", type=int, default=64)
     imdb_parser.add_argument("--seed", type=int, default=1)
@@ -874,7 +910,7 @@ def main():
     imdb_parser.add_argument("--num-units-plot", type=int, default=5)
 
     mg_parser = subparsers.add_parser("mg", help="Analyze Mackey-Glass input")
-    mg_parser.add_argument("--dynamics", type=str, default="sl", choices=["dho", "sl"])
+    mg_parser.add_argument("--dynamics", type=str, default="sl", choices=["sl", "lo", "dho"])
     mg_parser.add_argument("--num-hidden", type=int, default=50)
     mg_parser.add_argument("--batch-size", type=int, default=64)
     mg_parser.add_argument("--seed", type=int, default=1)
@@ -898,9 +934,18 @@ def main():
     mg_parser.add_argument("--random-init", type=float, default=None)
     mg_parser.add_argument("--checkpoint", type=str, default=None)
     mg_parser.add_argument("--num-units-plot", type=int, default=5)
+    mg_parser.add_argument("--val-fraction", type=float, default=0.1)
+    mg_parser.add_argument("--test-fraction", type=float, default=0.1)
+    mg_parser.add_argument("--encoding-analysis-examples", type=int, default=50)
+    mg_parser.add_argument(
+        "--encoding-grouping",
+        type=str,
+        default="all",
+        choices=["error", "target", "trend", "all"],
+    )
 
     compare_parser = subparsers.add_parser("compare", help="Compare sMNIST and IMDB input in one plot")
-    compare_parser.add_argument("--dynamics", type=str, default="sl", choices=["dho", "sl"])
+    compare_parser.add_argument("--dynamics", type=str, default="sl", choices=["sl", "lo", "dho"])
     compare_parser.add_argument("--num-hidden", type=int, default=50)
     compare_parser.add_argument("--batch-size", type=int, default=64)
     compare_parser.add_argument("--seed", type=int, default=1)
@@ -944,6 +989,12 @@ def main():
     compare_parser.add_argument("--random-init", type=float, default=None)
     compare_parser.add_argument("--checkpoint", type=str, default=None)
     compare_parser.add_argument("--shuffle", action="store_true")
+    compare_parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Output directory (default: results/input_analysis/compare_<timestamp>)",
+    )
 
     args = parser.parse_args()
 

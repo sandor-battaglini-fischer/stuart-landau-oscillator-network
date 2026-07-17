@@ -5,7 +5,21 @@ import torch
 
 class SLON(torch.nn.Module):
 
-    def __init__(self, num_input, num_nodes, num_output, h, alpha, omega, gamma, lambda_param=None, gamma_real=None, gamma_imag=None):
+    def __init__(
+        self,
+        num_input,
+        num_nodes,
+        num_output,
+        h,
+        alpha,
+        omega,
+        gamma,
+        lambda_param=None,
+        gamma_real=None,
+        gamma_imag=None,
+        use_tanh=True,
+        linear_dynamics=False,
+    ):
         super().__init__()
 
         self.num_input = num_input
@@ -14,6 +28,8 @@ class SLON(torch.nn.Module):
 
         self.h = h
         self.alpha = alpha
+        self.use_tanh = use_tanh
+        self.linear_dynamics = linear_dynamics
 
         if lambda_param is None:
             self.lambda_param = torch.ones(num_nodes) * (-abs(gamma))
@@ -49,12 +65,20 @@ class SLON(torch.nn.Module):
         
         z_state = torch.cat([z_real, z_imag], dim=1)
         
-        input_force = self.alpha * torch.tanh(
-            self.i2h(input_t)
-            + self.gain_rec * self.h2h(z_state)
-        )
-        
-        dz_dt = lambda_omega_coeff * z + gamma_coeff * torch.abs(z)**2 * z + torch.complex(input_force, torch.zeros_like(input_force))
+        pre_act = self.i2h(input_t) + self.gain_rec * self.h2h(z_state)
+        if self.use_tanh:
+            input_force = self.alpha * torch.tanh(pre_act)
+        else:
+            input_force = self.alpha * pre_act
+
+        if self.linear_dynamics:
+            dz_dt = lambda_omega_coeff * z + torch.complex(input_force, torch.zeros_like(input_force))
+        else:
+            dz_dt = (
+                lambda_omega_coeff * z
+                + gamma_coeff * torch.abs(z) ** 2 * z
+                + torch.complex(input_force, torch.zeros_like(input_force))
+            )
         
         z = z + self.h * dz_dt
         

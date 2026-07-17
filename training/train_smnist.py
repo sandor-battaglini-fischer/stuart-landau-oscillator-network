@@ -15,6 +15,7 @@ sys.path.append(PROJECT_ROOT)
 DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
 TASK = 'smnist'
 
+from utils.model_factory import build_oscillator, manifold_dynamics_type
 from utils.run_dirs import make_run_dir, sweep_summary_path, epoch_dir, save_training_checkpoint
 from utils.slon_analysis import extract_model_parameters, compute_parameter_statistics
 from utils.plotting_utils import (
@@ -35,12 +36,14 @@ parser.add_argument('--shuffle', action = 'store_true', help='whether to shuffle
 parser.add_argument('--seed', type=int, default=1, help='random seed')
 parser.add_argument('--lr', type=float, default=1e-2, help='learning rate')
 parser.add_argument('--h', type=float, default=1.0, help='microscopic time constant h (default: 1)')
-parser.add_argument('--alpha', type=float, default=0.04, help='excitability coefficient alpha')
+parser.add_argument('--alpha', type=float, default=0.05, help='excitability coefficient alpha')
 parser.add_argument('--omega', type=float, default=0.224, help='natural frequency omega') # 2 * pi / 28 for sMNIST
 parser.add_argument('--gamma', type=float, default=0.01, help='damping coefficient gamma')
 parser.add_argument('--lambda-param', type=float, default=0.1, help='Stuart-Landau: real part of linear coefficient lambda (default: -|gamma|)')
 parser.add_argument('--gamma-real', type=float, default=-0.1, help='Stuart-Landau: real part of nonlinear coefficient (default: -0.1)')
 parser.add_argument('--gamma-imag', type=float, default=-0.1, help='Stuart-Landau: imaginary part of nonlinear coefficient (default: 0.0)')
+parser.add_argument('--dynamics', type=str, default='sl', choices=['sl', 'lo', 'dho'], help='oscillator dynamics: sl (Stuart-Landau), lo (linear SL), or dho (damped harmonic)')
+parser.add_argument('--no-tanh', action='store_true', help='use linear input coupling instead of tanh')
 parser.add_argument('--sweep-omega', action='store_true', help='enable parameter sweep for omega')
 parser.add_argument('--omega-min', type=float, default=None, help='minimum omega value for sweep')
 parser.add_argument('--omega-max', type=float, default=None, help='maximum omega value for sweep')
@@ -53,10 +56,17 @@ parser.add_argument('--analyze-manifold', action='store_true', default=True,
                     help='Enable manifold dimension analysis (runs at end of training and every 10 epochs)')
 parser.add_argument('--skip-epoch-plots', action='store_true',
                     help='Skip per-epoch plots and manifold analysis (metrics still saved)')
+parser.add_argument('--sweep-mode', action='store_true',
+                    help='Minimal sweep outputs: only log.txt (parameters + metrics) and metrics.json')
+parser.add_argument('--output-dir', type=str, default=None,
+                    help='Explicit output directory for this run (overrides timestamped default)')
 parser.add_argument('--digit-analysis-examples', type=int, default=20,
                     help='number of test examples per digit for digit encoding analysis')
 
 args = parser.parse_args()
+
+if args.sweep_mode:
+    args.skip_epoch_plots = True
 
 if args.sweep_omega and args.sweep_lambda:
     raise ValueError("Cannot sweep both omega and lambda simultaneously. Choose one.")
@@ -68,9 +78,7 @@ if args.lambda_param > 0:
     )
 
 print(args)
-
-from models import SLON
-print("Using Stuart-Landau dynamics")
+print(f"Using {args.dynamics} dynamics")
 
 # fix seed
 torch.manual_seed(args.seed)
@@ -103,14 +111,20 @@ test_loader = torch.utils.data.DataLoader(dataset=test_set, batch_size=batch_siz
 def train_with_params(omega_value, lambda_value=None, sweep_idx=None, sweep_type=None):
     lambda_param = lambda_value if lambda_value is not None else args.lambda_param
     
-    model = SLON(dim_input, args.num_hidden, dim_output, args.h, args.alpha, omega_value, args.gamma,
-                 lambda_param=lambda_param, gamma_real=args.gamma_real, gamma_imag=args.gamma_imag)
+    model = build_oscillator(
+        args.dynamics, dim_input, args.num_hidden, dim_output, args.h, args.alpha, omega_value, args.gamma,
+        lambda_param=lambda_param, gamma_real=args.gamma_real, gamma_imag=args.gamma_imag,
+        use_tanh=not args.no_tanh,
+    )
 
     loss = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr = args.lr)
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    if sweep_idx is not None:
+    if args.output_dir is not None:
+        output_dir = args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+    elif sweep_idx is not None:
         if sweep_type == 'omega':
             sweep_suffix = f'omega{omega_value:.6f}'
         elif sweep_type == 'lambda':
@@ -125,7 +139,8 @@ def train_with_params(omega_value, lambda_value=None, sweep_idx=None, sweep_type
     fh_log.write('='*60 + '\n')
     fh_log.write('Training Parameters\n')
     fh_log.write('='*60 + '\n')
-    fh_log.write(f'dynamics: sl (Stuart-Landau)\n')
+    fh_log.write(f'dynamics: {args.dynamics}\n')
+    fh_log.write(f'use_tanh: {not args.no_tanh}\n')
     fh_log.write(f'num_hidden: {args.num_hidden}\n')
     fh_log.write(f'epochs: {args.epochs}\n')
     fh_log.write(f'batch_size: {args.batch_size}\n')
@@ -163,7 +178,7 @@ def evaluate_model(data_loader, model, loss, output_dir, epoch = None, batch = N
                 images = images[perm, :, :]
 
             # run model inference - record true returns dynamics
-            output = model(images, record = True)
+            output = model(images, record=not args.sweep_mode)
             prediction = output['output']
 
             # compute loss + number of correct predictions
@@ -203,13 +218,14 @@ def run_training(omega_value, lambda_value=None, sweep_idx=None, sweep_type=None
     val_losses = []
     test_losses = []
     
-    example_images, example_label = next(iter(test_loader))
-    example_images = example_images[0:1]
-    example_label = int(example_label[0].item())
-    example_inputs = example_images.reshape(1, 1, 784).permute(2, 0, 1)
-
+    example_images, example_label = None, None
+    example_inputs = None
     digit_batches = None
     if not args.skip_epoch_plots:
+        example_images, example_label = next(iter(test_loader))
+        example_images = example_images[0:1]
+        example_label = int(example_label[0].item())
+        example_inputs = example_images.reshape(1, 1, 784).permute(2, 0, 1)
         digit_batches = find_class_examples_batch(
             test_loader,
             labels=tuple(range(10)),
@@ -323,20 +339,21 @@ def run_training(omega_value, lambda_value=None, sweep_idx=None, sweep_type=None
         val_losses.append(val_loss_avg)
         test_losses.append(test_loss_avg)
 
-        model_params = extract_model_parameters(model, 'sl')
-        param_stats = compute_parameter_statistics(model_params)
-        parameters_history.append({
-            "epoch": epoch,
-            "params": model_params,
-            "stats": param_stats
-        })
+        if not args.sweep_mode:
+            model_params = extract_model_parameters(model, args.dynamics)
+            param_stats = compute_parameter_statistics(model_params)
+            parameters_history.append({
+                "epoch": epoch,
+                "params": model_params,
+                "stats": param_stats
+            })
 
-        params_file = f'{output_dir}/parameters.json'
-        with open(params_file, 'w') as f:
-            json.dump(parameters_history, f, indent=2)
+            params_file = f'{output_dir}/parameters.json'
+            with open(params_file, 'w') as f:
+                json.dump(parameters_history, f, indent=2)
 
-        ep_dir = epoch_dir(output_dir, epoch)
         if not args.skip_epoch_plots:
+            ep_dir = epoch_dir(output_dir, epoch)
             try:
                 cm = plot_classification_epoch(
                     output_dir=output_dir,
@@ -400,6 +417,12 @@ def run_training(omega_value, lambda_value=None, sweep_idx=None, sweep_type=None
                     f"phase_score={encoding_summary.get('phase_separation_score', 0):.3f}, "
                     f"frequency_score={encoding_summary.get('frequency_separation_score', 0):.3f}\n"
                 )
+                z_mag_nodes = encoding_summary.get("node_activity", {}).get("z_magnitude", {})
+                if z_mag_nodes:
+                    fh_log.write(
+                        f"  top active |z| nodes: {z_mag_nodes.get('top_active_nodes', [])}, "
+                        f"top discriminative |z| nodes: {z_mag_nodes.get('top_discriminative_nodes', [])}\n"
+                    )
                 fh_log.flush()
             except Exception as e:
                 tqdm.write(f"Warning: Failed to generate digit encoding analysis at epoch {epoch}: {e}")
@@ -438,7 +461,7 @@ def run_training(omega_value, lambda_value=None, sweep_idx=None, sweep_type=None
                 manifold_results_epoch = analyze_manifold_dimension(
                     test_loader,
                     model,
-                    'sl',
+                    manifold_dynamics_type(args.dynamics),
                     ep_dir,
                     epoch=epoch,
                     batch_size_test=batch_size_test,
@@ -453,8 +476,9 @@ def run_training(omega_value, lambda_value=None, sweep_idx=None, sweep_type=None
             except Exception as e:
                 tqdm.write(f"Warning: Manifold dimension analysis failed at epoch {epoch}: {e}")
 
-        save_training_checkpoint(model, output_dir, is_best=is_best)
-        tqdm.write(f'wrote checkpoint last_model.pt{" + best_model.pt" if is_best else ""}')
+        if not args.sweep_mode:
+            save_training_checkpoint(model, output_dir, is_best=is_best)
+            tqdm.write(f'wrote checkpoint last_model.pt{" + best_model.pt" if is_best else ""}')
 
     
     msg = f'best test: {final_test_acc:.2f} (val: {best_eval:.2f})'
@@ -474,7 +498,7 @@ def run_training(omega_value, lambda_value=None, sweep_idx=None, sweep_type=None
             manifold_results = analyze_manifold_dimension(
                 test_loader,
                 model,
-                'sl',
+                manifold_dynamics_type(args.dynamics),
                 output_dir,
                 epoch=None,
                 batch_size_test=batch_size_test,
@@ -518,7 +542,7 @@ def run_training(omega_value, lambda_value=None, sweep_idx=None, sweep_type=None
             collect_and_save_final_states(
                 test_loader,
                 model,
-                'sl',
+                manifold_dynamics_type(args.dynamics),
                 output_dir,
                 batch_size_test=batch_size_test,
                 max_samples=50000,

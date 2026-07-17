@@ -20,8 +20,6 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from utils.plotting_utils.style import thesis_red, thesis_blue, ifisc_green
-
 BEST_TEST_RE = re.compile(r"best test:\s*([\d.]+)", re.IGNORECASE)
 
 
@@ -31,6 +29,7 @@ class TaskConfig:
     script: str
     output_glob: str
     metric_label: str
+    alpha_center: float
     base_cmd: list[str] = field(default_factory=list)
 
 
@@ -39,7 +38,8 @@ TASKS: dict[str, TaskConfig] = {
         name="IMDB",
         script="training/train_imdb.py",
         output_glob="results/imdb/*",
-        metric_label="test accuracy (%)",
+        metric_label=r"Test accuracy ($\%$)",
+        alpha_center=0.5,
         base_cmd=[
             sys.executable,
             "training/train_imdb.py",
@@ -53,13 +53,15 @@ TASKS: dict[str, TaskConfig] = {
             "--lambda-param", "-0.05",
             "--gamma-real", "-0.1",
             "--gamma-imag", "0.1",
+            "--sweep-mode",
         ],
     ),
     "smnist": TaskConfig(
         name="sMNIST",
         script="training/train_smnist.py",
         output_glob="results/smnist/*",
-        metric_label="test accuracy (%)",
+        metric_label=r"Test accuracy ($\%$)",
+        alpha_center=0.5,
         base_cmd=[
             sys.executable,
             "training/train_smnist.py",
@@ -68,13 +70,15 @@ TASKS: dict[str, TaskConfig] = {
             "--gamma-imag", "0.0",
             "--epochs", "10",
             "--num-hidden", "128",
+            "--sweep-mode",
         ],
     ),
     "mackey_glass": TaskConfig(
         name="Mackey-Glass",
         script="training/train_mackey_glass.py",
         output_glob="results/mackey_glass/*",
-        metric_label=r"test $R^2$",
+        metric_label=r"Test $R^2$",
+        alpha_center=0.05,
         base_cmd=[
             sys.executable,
             "training/train_mackey_glass.py",
@@ -86,16 +90,16 @@ TASKS: dict[str, TaskConfig] = {
             "--lambda-param", "-0.1",
             "--gamma-real", "-0.1",
             "--gamma-imag", "0.0",
-            "--mg-tau", "34.0",
+            "--mg-tau", "17.0",
             "--horizon", "1",
             "--series-length", "20000",
             "--val-fraction", "0.1",
             "--test-fraction", "0.1",
-            "--lr", "1e-2",
+            "--lr", "1e-4",
             "--batch-size", "64",
-            "--seed", "1",
             "--lr-decay-power", "1.0",
             "--min-lr-ratio", "0.0",
+            "--sweep-mode",
         ],
     ),
 }
@@ -105,6 +109,33 @@ def alpha_values(alpha_min: float, alpha_max: float, alpha_step: float) -> list[
     values = np.arange(alpha_min, alpha_max + 0.5 * alpha_step, alpha_step)
     rounded = [round(float(v), 10) for v in values]
     return [v for v in rounded if v <= alpha_max + 1e-9]
+
+
+def default_alpha_grid(alpha_min: float, alpha_max: float) -> list[float]:
+    values: list[float] = []
+    if alpha_min < 1.0 - 1e-9:
+        fine_end = min(alpha_max, 1.0)
+        values.extend(alpha_values(alpha_min, fine_end, 0.1))
+    if alpha_max > 1.0 + 1e-9:
+        coarse_start = max(alpha_min, 1.0)
+        coarse = alpha_values(coarse_start, alpha_max, 0.5)
+        if values and coarse and abs(coarse[0] - values[-1]) < 1e-9:
+            coarse = coarse[1:]
+        values.extend(coarse)
+    return values
+
+
+def alpha_grid(alpha_min: float, alpha_max: float, alpha_step: float | None) -> list[float]:
+    if alpha_step is not None:
+        return alpha_values(alpha_min, alpha_max, alpha_step)
+    return default_alpha_grid(alpha_min, alpha_max)
+
+
+def iter_runs(task_keys: list[str], alphas: list[float], seeds: list[int]):
+    for alpha in alphas:
+        for seed in seeds:
+            for task_key in task_keys:
+                yield task_key, alpha, seed
 
 
 def parse_classification_metric(text: str) -> float | None:
@@ -169,6 +200,7 @@ def save_csv(results_path: Path, results: dict) -> None:
             row = {
                 "task": task_key,
                 "alpha": entry.get("alpha"),
+                "seed": entry.get("seed"),
                 "metric": entry.get("metric"),
                 "status": entry.get("status"),
                 "output_dir": entry.get("output_dir"),
@@ -192,28 +224,83 @@ def save_csv(results_path: Path, results: dict) -> None:
         writer.writerows(rows)
 
 
-def existing_alphas(results: dict, task_key: str) -> set[float]:
+def aggregate_task_results(entries: list[dict]) -> list[dict]:
+    by_alpha: dict[float, list[float]] = {}
+    for entry in entries:
+        if entry.get("status") != "ok" or entry.get("metric") is None:
+            continue
+        alpha = round(float(entry["alpha"]), 10)
+        by_alpha.setdefault(alpha, []).append(float(entry["metric"]))
+
+    summary = []
+    for alpha in sorted(by_alpha):
+        metrics = np.asarray(by_alpha[alpha], dtype=float)
+        n = len(metrics)
+        mean = float(np.mean(metrics))
+        std = float(np.std(metrics, ddof=1)) if n > 1 else 0.0
+        sem = std / np.sqrt(n) if n > 1 else 0.0
+        ci95 = 1.96 * sem
+        summary.append(
+            {
+                "alpha": alpha,
+                "n_runs": n,
+                "mean": mean,
+                "std": std,
+                "sem": sem,
+                "ci95": ci95,
+                "min": float(np.min(metrics)),
+                "max": float(np.max(metrics)),
+            }
+        )
+    return summary
+
+
+def save_summary(results_path: Path, results: dict) -> None:
+    summary = {
+        task_key: aggregate_task_results(results.get(task_key, []))
+        for task_key in TASKS
+    }
+    summary_path = results_path.with_name("summary.json")
+    with summary_path.open("w") as f:
+        json.dump(summary, f, indent=2)
+
+
+def existing_completions(results: dict, task_key: str) -> set[tuple[float, int]]:
     return {
-        round(float(entry["alpha"]), 10)
+        (round(float(entry["alpha"]), 10), int(entry.get("seed", 1)))
         for entry in results.get(task_key, [])
         if entry.get("status") == "ok"
     }
 
 
+def cmd_with_overrides(base_cmd: list[str], seed: int, alpha: float) -> list[str]:
+    cmd: list[str] = []
+    i = 0
+    while i < len(base_cmd):
+        if base_cmd[i] in {"--seed", "--alpha"}:
+            i += 2
+            continue
+        cmd.append(base_cmd[i])
+        i += 1
+    return [*cmd, "--seed", str(seed), "--alpha", str(alpha)]
+
+
 def run_single(
     task_key: str,
     alpha: float,
+    seed: int,
     sweep_dir: Path,
     dry_run: bool,
 ) -> dict:
     task = TASKS[task_key]
-    cmd = [*task.base_cmd, "--alpha", str(alpha)]
-    run_name = f"{task_key}_alpha{alpha:.2f}"
+    cmd = cmd_with_overrides(task.base_cmd, seed, alpha)
+    run_name = f"{task_key}_alpha{alpha:.4f}_seed{seed}"
     log_path = sweep_dir / "logs" / f"{run_name}.log"
 
     record = {
         "task": task_key,
         "alpha": alpha,
+        "seed": seed,
         "status": "pending",
         "command": cmd,
         "log_path": str(log_path.relative_to(sweep_dir)),
@@ -226,7 +313,7 @@ def run_single(
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
     start = time.time()
-    print(f"\n{'=' * 60}\n{task.name} | alpha={alpha:.2f}\n{'=' * 60}")
+    print(f"\n{'=' * 60}\n{task.name} | alpha={alpha:.4f} | seed={seed}\n{'=' * 60}")
     print(" ".join(cmd))
 
     proc = subprocess.run(
@@ -275,30 +362,46 @@ def run_single(
 
 
 def plot_results(results: dict, plot_path: Path) -> None:
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4), sharex=True)
+    n_tasks = len(TASKS)
+    fig, axes = plt.subplots(n_tasks, 1, figsize=(7, 3.2 * n_tasks), sharex=True)
+    if n_tasks == 1:
+        axes = [axes]
     colors = {
-        "imdb": thesis_blue,
-        "smnist": ifisc_green,
-        "mackey_glass": thesis_red,
+        "imdb": "black",
+        "smnist": "black",
+        "mackey_glass": "black",
     }
 
     for ax, (task_key, task) in zip(axes, TASKS.items()):
-        entries = sorted(
-            [e for e in results.get(task_key, []) if e.get("status") == "ok"],
-            key=lambda e: e["alpha"],
-        )
-        if not entries:
-            ax.set_title(f"{task.name}\n(no successful runs)")
-            ax.set_xlabel(r"$\alpha$")
+        summary = aggregate_task_results(results.get(task_key, []))
+        if not summary:
+            ax.set_title(f"{task.name} (no successful runs)", loc="left")
             continue
 
-        alphas = [e["alpha"] for e in entries]
-        metrics = [e["metric"] for e in entries]
-        ax.plot(alphas, metrics, "o-", color=colors[task_key], linewidth=2, markersize=5)
-        ax.set_title(task.name)
+        alphas = [row["alpha"] for row in summary]
+        means = [row["mean"] for row in summary]
+        ci95 = [row["ci95"] for row in summary]
+        color = colors[task_key]
+
+        lower_ci = [m - c for m, c in zip(means, ci95)]
+        upper_ci = [m + c for m, c in zip(means, ci95)]
+
+        ax.fill_between(
+            alphas, lower_ci, upper_ci, color=color, alpha=0.25, linewidth=0, label="$95\\%$ CI"
+        )
+        ax.plot(alphas, means, "o-", color=color, linewidth=2, markersize=5, label="mean")
+        ax.axvline(task.alpha_center, color=color, linestyle="--", alpha=0.5, linewidth=1)
+
+        ax.set_title(task.name, loc="left")
         ax.set_ylabel(task.metric_label)
-        ax.set_xlabel(r"$\alpha$ (excitability)")
         ax.grid(True, alpha=0.3)
+        if task_key == "mackey_glass":
+            ax.set_ylim(0.0, 1.0)
+        else:
+            ax.set_ylim(50.0, 100.0)
+        ax.legend(loc="lower left", frameon=True, fontsize=14)
+
+    axes[-1].set_xlabel(r"$\alpha$")
 
     fig.suptitle("Performance vs pre-input excitability $\\alpha$", y=1.02)
     fig.tight_layout()
@@ -319,14 +422,36 @@ def main() -> None:
     )
     parser.add_argument("--alpha-min", type=float, default=0.0)
     parser.add_argument("--alpha-max", type=float, default=5.0)
-    parser.add_argument("--alpha-step", type=float, default=0.25)
+    parser.add_argument(
+        "--alpha-step",
+        type=float,
+        default=None,
+        help="Uniform alpha step (default: 0.1 in [0,1], 0.5 in (1,5])",
+    )
     parser.add_argument(
         "--sweep-dir",
         type=str,
         default=None,
         help="Directory for sweep outputs (default: results/sweeps/alpha_sweep_<timestamp>)",
     )
-    parser.add_argument("--skip-existing", action="store_true", help="Skip alphas already in results.json")
+    parser.add_argument(
+        "--num-runs",
+        type=int,
+        default=10,
+        help="Number of independent runs per (task, alpha) with different seeds (default: 10)",
+    )
+    parser.add_argument(
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Explicit seeds to use (default: 1..num-runs)",
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip (task, alpha, seed) combinations already in results.json",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print commands without running training")
     parser.add_argument("--plot-only", action="store_true", help="Only plot from existing results.json")
     parser.add_argument(
@@ -343,13 +468,14 @@ def main() -> None:
     plot_path = sweep_dir / "alpha_sweep_performance.png"
 
     results = load_results(results_path)
+    seeds = args.seeds if args.seeds is not None else list(range(1, args.num_runs + 1))
 
     if args.with_manifold:
         for task in TASKS.values():
-            task.base_cmd = [c for c in task.base_cmd if c != "--no-analyze-manifold"]
+            task.base_cmd = [c for c in task.base_cmd if c != "--sweep-mode"]
 
     if not args.plot_only:
-        alphas = alpha_values(args.alpha_min, args.alpha_max, args.alpha_step)
+        alphas = alpha_grid(args.alpha_min, args.alpha_max, args.alpha_step)
         config_path = sweep_dir / "sweep_config.json"
         with config_path.open("w") as f:
             json.dump(
@@ -358,6 +484,8 @@ def main() -> None:
                     "alpha_max": args.alpha_max,
                     "alpha_step": args.alpha_step,
                     "alphas": alphas,
+                    "num_runs": args.num_runs,
+                    "seeds": seeds,
                     "tasks": args.tasks,
                 },
                 f,
@@ -367,28 +495,44 @@ def main() -> None:
         for task_key in args.tasks:
             if task_key not in results:
                 results[task_key] = []
-            done = existing_alphas(results, task_key) if args.skip_existing else set()
 
-            for alpha in alphas:
-                alpha_key = round(float(alpha), 10)
-                if alpha_key in done:
-                    print(f"Skipping {task_key} alpha={alpha:.2f} (already completed)")
-                    continue
+        done_by_task = {
+            task_key: existing_completions(results, task_key) if args.skip_existing else set()
+            for task_key in args.tasks
+        }
 
-                record = run_single(task_key, alpha, sweep_dir, args.dry_run)
-                if record["status"] != "dry_run":
-                    results[task_key] = [
-                        e for e in results[task_key] if round(float(e.get("alpha", -1)), 10) != alpha_key
-                    ]
-                    results[task_key].append(record)
-                    save_results(results_path, results)
-                    save_csv(results_path, results)
+        for task_key, alpha, seed in iter_runs(args.tasks, alphas, seeds):
+            alpha_key = round(float(alpha), 10)
+            if (alpha_key, seed) in done_by_task[task_key]:
+                print(f"Skipping {task_key} alpha={alpha:.4f} seed={seed} (already completed)")
+                continue
+
+            record = run_single(task_key, alpha, seed, sweep_dir, args.dry_run)
+            if record["status"] != "dry_run":
+                results[task_key] = [
+                    e
+                    for e in results[task_key]
+                    if not (
+                        round(float(e.get("alpha", -1)), 10) == alpha_key
+                        and int(e.get("seed", -1)) == seed
+                    )
+                ]
+                results[task_key].append(record)
+                save_results(results_path, results)
+                save_csv(results_path, results)
+                save_summary(results_path, results)
+                plot_results(results, plot_path)
 
         save_results(results_path, results)
         save_csv(results_path, results)
+        save_summary(results_path, results)
+
+    else:
+        save_summary(results_path, results)
 
     plot_results(results, plot_path)
     print(f"\nResults: {results_path}")
+    print(f"Summary: {results_path.with_name('summary.json')}")
     print(f"CSV:     {results_path.with_suffix('.csv')}")
 
 

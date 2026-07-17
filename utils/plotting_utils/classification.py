@@ -11,7 +11,7 @@ from .helpers import as_float, set_epoch_xlim, set_value_ylim
 from .style import ifisc_green, thesis_blue, thesis_red
 
 
-def plot_confusion_matrix(y_true, y_pred, output_dir, num_classes=10, class_labels=None, epoch=None, normalize=True):
+def plot_confusion_matrix(y_true, y_pred, output_dir, num_classes=10, class_labels=None, epoch=None, normalize=True, title=None):
     if class_labels is None:
         if num_classes == 2:
             class_labels = ["Negative", "Positive"]
@@ -45,7 +45,7 @@ def plot_confusion_matrix(y_true, y_pred, output_dir, num_classes=10, class_labe
         yticks=np.arange(num_classes),
         xticklabels=class_labels,
         yticklabels=class_labels,
-        title="Confusion Matrix"
+        title=(title or "Confusion Matrix")
         + (" (Normalized)" if normalize else "")
         + (f" - Epoch {epoch}" if epoch is not None else ""),
         ylabel="True Label",

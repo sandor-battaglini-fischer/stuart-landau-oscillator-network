@@ -16,6 +16,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(PROJECT_ROOT)
 TASK = 'mackey_glass'
 
+from utils.model_factory import build_oscillator, manifold_dynamics_type
 from utils.run_dirs import make_run_dir, sweep_summary_path, epoch_dir, save_training_checkpoint, promote_epoch_artifacts
 from utils.manifold_dimension_analysis import analyze_manifold_dimension, collect_and_save_final_states
 from utils.slon_analysis import extract_model_parameters, compute_parameter_statistics
@@ -26,7 +27,9 @@ from utils.plotting_utils import (
     plot_epoch_weight_heatmaps,
     create_mackey_glass_gifs,
     plot_signal_stages_for_example,
+    plot_mackey_glass_encoding_analysis_from_loader,
 )
+from utils.plotting_utils.mackey_glass_encoding import GROUP_LABELS
 
 
 class MackeyGlassDataset(Dataset):
@@ -365,9 +368,8 @@ def train_with_params(
 ):
     lambda_param = lambda_value if lambda_value is not None else args.lambda_param
 
-    from models import SLON
-
-    model = SLON(
+    model = build_oscillator(
+            args.dynamics,
             1,
             args.num_hidden,
             1,
@@ -378,6 +380,7 @@ def train_with_params(
             lambda_param=lambda_param,
             gamma_real=args.gamma_real,
             gamma_imag=args.gamma_imag,
+            use_tanh=not args.no_tanh,
         )
 
     mse_loss_fn = torch.nn.MSELoss()
@@ -399,7 +402,10 @@ def train_with_params(
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if sweep_idx is not None:
+    if args.output_dir is not None:
+        output_dir = args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+    elif sweep_idx is not None:
         if sweep_type == "omega":
             sweep_suffix = f"omega{omega_value:.6f}"
         elif sweep_type == "lambda":
@@ -733,18 +739,19 @@ def run_training(
         with open(metrics_file, "w") as f:
             json.dump(all_metrics, f, indent=2)
         
-        model_params = extract_model_parameters(model, "sl")
-        param_stats = compute_parameter_statistics(model_params)
-        parameters_history.append({
-            "epoch": epoch,
-            "params": model_params,
-            "stats": param_stats
-        })
-        
-        params_file = f"{output_dir}/parameters.json"
-        with open(params_file, "w") as f:
-            json.dump(parameters_history, f, indent=2)
-        
+        if not args.sweep_mode:
+            model_params = extract_model_parameters(model, args.dynamics)
+            param_stats = compute_parameter_statistics(model_params)
+            parameters_history.append({
+                "epoch": epoch,
+                "params": model_params,
+                "stats": param_stats
+            })
+
+            params_file = f"{output_dir}/parameters.json"
+            with open(params_file, "w") as f:
+                json.dump(parameters_history, f, indent=2)
+
         if not args.skip_epoch_plots:
             plot_mackey_glass_parameter_analysis(parameters_history, output_dir, epoch, fh_log=fh_log)
 
@@ -818,6 +825,55 @@ def run_training(
             except Exception as e:
                 tqdm.write(f"Warning: Failed to generate signal stage plots at epoch {epoch}: {e}")
 
+            try:
+                if args.encoding_grouping == "all":
+                    num_per_group = max(1, args.encoding_analysis_examples // 3)
+                else:
+                    num_per_group = max(1, args.encoding_analysis_examples // len(GROUP_LABELS[args.encoding_grouping]))
+                encoding_summaries = plot_mackey_glass_encoding_analysis_from_loader(
+                    model,
+                    test_loader,
+                    ep_dir,
+                    epoch,
+                    grouping=args.encoding_grouping,
+                    num_per_group=num_per_group,
+                    num_units_plot=min(5, args.num_hidden),
+                    tau_steps=tau_steps,
+                )
+                if args.encoding_grouping == "all":
+                    for group_mode, summary in encoding_summaries.items():
+                        fh_log.write(
+                            f"MG encoding ({group_mode}) epoch {epoch}: "
+                            f"dominant={summary.get('dominant_encoding', 'n/a')}, "
+                            f"magnitude_score={summary.get('magnitude_separation_score', 0):.3f}, "
+                            f"phase_score={summary.get('phase_separation_score', 0):.3f}, "
+                            f"frequency_score={summary.get('frequency_separation_score', 0):.3f}\n"
+                        )
+                        z_mag_nodes = summary.get("node_activity", {}).get("z_magnitude", {})
+                        if z_mag_nodes:
+                            fh_log.write(
+                                f"  top active |z| nodes ({group_mode}): {z_mag_nodes.get('top_active_nodes', [])}, "
+                                f"top discriminative |z| nodes: {z_mag_nodes.get('top_discriminative_nodes', [])}\n"
+                            )
+                else:
+                    summary = encoding_summaries
+                    fh_log.write(
+                        f"MG encoding epoch {epoch}: "
+                        f"dominant={summary.get('dominant_encoding', 'n/a')}, "
+                        f"magnitude_score={summary.get('magnitude_separation_score', 0):.3f}, "
+                        f"phase_score={summary.get('phase_separation_score', 0):.3f}, "
+                        f"frequency_score={summary.get('frequency_separation_score', 0):.3f}\n"
+                    )
+                    z_mag_nodes = summary.get("node_activity", {}).get("z_magnitude", {})
+                    if z_mag_nodes:
+                        fh_log.write(
+                            f"  top active |z| nodes: {z_mag_nodes.get('top_active_nodes', [])}, "
+                            f"top discriminative |z| nodes: {z_mag_nodes.get('top_discriminative_nodes', [])}\n"
+                        )
+                fh_log.flush()
+            except Exception as e:
+                tqdm.write(f"Warning: Failed to generate Mackey-Glass encoding analysis at epoch {epoch}: {e}")
+
         is_best = val_normalized < best_val_normalized
         if is_best:
             best_val_normalized = val_normalized
@@ -838,10 +894,12 @@ def run_training(
         fh_log.flush()
         tqdm.write(msg)
 
-        save_training_checkpoint(model, output_dir, is_best=is_best)
-        tqdm.write(f'wrote checkpoint last_model.pt{" + best_model.pt" if is_best else ""}')
+        if not args.sweep_mode:
+            save_training_checkpoint(model, output_dir, is_best=is_best)
+            tqdm.write(f'wrote checkpoint last_model.pt{" + best_model.pt" if is_best else ""}')
 
         if not args.skip_epoch_plots and epoch == args.epochs - 1:
+            ep_dir = epoch_dir(output_dir, epoch)
             promote_epoch_artifacts(ep_dir, output_dir, {
                 f"mg_pred_epoch{epoch:02d}.png": "mg_pred.png",
                 f"mg_pred_epoch{epoch:02d}_zoom.png": "mg_pred_zoom.png",
@@ -857,7 +915,7 @@ def run_training(
                 manifold_results_epoch = analyze_manifold_dimension(
                     test_loader,
                     model,
-                    "sl",
+                    manifold_dynamics_type(args.dynamics),
                     ep_dir,
                     epoch=epoch,
                     batch_size_test=batch_size,
@@ -890,7 +948,7 @@ def run_training(
             manifold_results = analyze_manifold_dimension(
                 test_loader, 
                 model, 
-                "sl", 
+                manifold_dynamics_type(args.dynamics), 
                 output_dir,
                 epoch=None,
                 batch_size_test=batch_size,
@@ -940,7 +998,7 @@ def run_training(
             collect_and_save_final_states(
                 test_loader,
                 model,
-                "sl",
+                manifold_dynamics_type(args.dynamics),
                 output_dir,
                 batch_size_test=batch_size,
                 max_samples=50000,
@@ -983,12 +1041,14 @@ def main():
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--h", type=float, default=1.0)
-    parser.add_argument("--alpha", type=float, default=0.04)
+    parser.add_argument("--alpha", type=float, default=0.05)
     parser.add_argument("--omega", type=float, default=0.224)
     parser.add_argument("--gamma", type=float, default=0.01)
     parser.add_argument("--lambda-param", type=float, default=-0.04)
     parser.add_argument("--gamma-real", type=float, default=-0.05)
     parser.add_argument("--gamma-imag", type=float, default=0.1)
+    parser.add_argument("--dynamics", type=str, default="sl", choices=["sl", "lo", "dho"])
+    parser.add_argument("--no-tanh", action="store_true")
 
     parser.add_argument("--sweep-omega", action="store_true")
     parser.add_argument("--omega-min", type=float, default=None)
@@ -1022,8 +1082,20 @@ def main():
                         help="Enable manifold dimension analysis (runs at end of training and every 10 epochs)", default=True)
     parser.add_argument("--skip-epoch-plots", action="store_true",
                         help="Skip per-epoch plots and manifold analysis (metrics still saved)")
+    parser.add_argument("--encoding-analysis-examples", type=int, default=50,
+                        help="Number of test examples per forecast group for encoding analysis")
+    parser.add_argument("--encoding-grouping", type=str, default="all",
+                        choices=["error", "target", "trend", "all"],
+                        help="How to group Mackey-Glass forecasts for encoding analysis")
+    parser.add_argument("--sweep-mode", action="store_true",
+                        help="Minimal sweep outputs: only log.txt (parameters + metrics) and metrics.json")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Explicit output directory for this run (overrides timestamped default)")
 
     args = parser.parse_args()
+
+    if args.sweep_mode:
+        args.skip_epoch_plots = True
 
     if args.sweep_omega and args.sweep_lambda:
         raise ValueError("Cannot sweep both omega and lambda simultaneously.")

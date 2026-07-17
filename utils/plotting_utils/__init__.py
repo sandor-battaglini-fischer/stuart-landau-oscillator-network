@@ -22,9 +22,26 @@ from .parameters import (
 )
 from .regression import plot_regression_metrics
 from .class_encoding import plot_smnist_digit_encoding_analysis
+from .smnist_pixel_reconstruction import (
+    build_digit_prototypes,
+    classify_reconstructed_digits,
+    evaluate_pixel_reconstruction,
+    plot_pixel_metric_heatmaps,
+    plot_pixel_metrics_vs_scan_index,
+    plot_pixel_metrics_vs_scan_index_by_digit,
+    plot_pixel_reconstruction_epoch,
+    plot_reconstruction_examples,
+    plot_reconstruction_scatter,
+    prepare_smnist_sequence,
+)
 from .sentiment_encoding import (
     find_class_examples_batch,
     plot_imdb_sentiment_encoding_analysis,
+)
+from .mackey_glass_encoding import (
+    collect_mg_forecast_batches,
+    plot_mackey_glass_encoding_analysis,
+    plot_mackey_glass_encoding_analysis_from_loader,
 )
 from .signal_stages import (
     find_class_examples,
@@ -80,4 +97,17 @@ __all__ = [
     "find_class_examples_batch",
     "plot_imdb_sentiment_encoding_analysis",
     "plot_smnist_digit_encoding_analysis",
+    "prepare_smnist_sequence",
+    "build_digit_prototypes",
+    "classify_reconstructed_digits",
+    "evaluate_pixel_reconstruction",
+    "plot_pixel_metric_heatmaps",
+    "plot_pixel_metrics_vs_scan_index",
+    "plot_pixel_metrics_vs_scan_index_by_digit",
+    "plot_reconstruction_examples",
+    "plot_reconstruction_scatter",
+    "plot_pixel_reconstruction_epoch",
+    "collect_mg_forecast_batches",
+    "plot_mackey_glass_encoding_analysis",
+    "plot_mackey_glass_encoding_analysis_from_loader",
 ]

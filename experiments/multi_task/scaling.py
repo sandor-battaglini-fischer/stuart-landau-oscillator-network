@@ -141,6 +141,7 @@ def run_imdb_scaling(num_hidden_list, base_args, output_base_dir):
             "--gamma-real", str(base_args.get("gamma_real", -0.1)),
             "--gamma-imag", str(base_args.get("gamma_imag", 0.1)),
             "--dynamics", base_args.get("dynamics", "sl"),
+            "--sweep-mode",
         ]
         
         if "embed_dim" in base_args:
@@ -213,6 +214,7 @@ def run_smnist_scaling(num_hidden_list, base_args, output_base_dir):
             "--gamma-real", str(base_args.get("gamma_real", -0.05)),
             "--gamma-imag", str(base_args.get("gamma_imag", 0.1)),
             "--dynamics", base_args.get("dynamics", "sl"),
+            "--sweep-mode",
         ]
         
         try:
@@ -400,7 +402,8 @@ def main():
         "--num-hidden-list",
         type=str,
         required=True,
-        help="Comma-separated list of num_hidden values (e.g., '1,2,4,9,50,128')"
+        help="Comma-separated list of num_hidden values (e.g., '1,2,4,9,50,128')",
+        default="1,2,4,9,16,25,50,128"
     )
     
     parser.add_argument(
@@ -432,7 +435,7 @@ def main():
     mg_group.add_argument("--mg-lambda-param", type=float, default=-0.1)
     mg_group.add_argument("--mg-gamma-real", type=float, default=-0.1)
     mg_group.add_argument("--mg-gamma-imag", type=float, default=0.0)
-    mg_group.add_argument("--mg-dynamics", type=str, default="sl", choices=["dho", "sl"])
+    mg_group.add_argument("--mg-dynamics", type=str, default="sl", choices=["sl", "lo", "dho"])
     mg_group.add_argument("--mg-series-length", type=int, default=20000)
     mg_group.add_argument("--mg-input-length", type=int, default=100)
     mg_group.add_argument("--mg-horizon", type=int, default=1)
@@ -453,7 +456,7 @@ def main():
     imdb_group.add_argument("--imdb-lambda-param", type=float, default=-0.05)
     imdb_group.add_argument("--imdb-gamma-real", type=float, default=-0.1)
     imdb_group.add_argument("--imdb-gamma-imag", type=float, default=0.1)
-    imdb_group.add_argument("--imdb-dynamics", type=str, default="sl", choices=["dho", "sl"])
+    imdb_group.add_argument("--imdb-dynamics", type=str, default="sl", choices=["sl", "lo", "dho"])
     imdb_group.add_argument("--imdb-embed-dim", type=int, default=100)
     imdb_group.add_argument("--imdb-max-len", type=int, default=175)
     imdb_group.add_argument("--imdb-dropout", type=float, default=0.3)
@@ -470,7 +473,7 @@ def main():
     smnist_group.add_argument("--smnist-lambda-param", type=float, default=0.1)
     smnist_group.add_argument("--smnist-gamma-real", type=float, default=-0.05)
     smnist_group.add_argument("--smnist-gamma-imag", type=float, default=0.1)
-    smnist_group.add_argument("--smnist-dynamics", type=str, default="sl", choices=["dho", "sl"])
+    smnist_group.add_argument("--smnist-dynamics", type=str, default="sl", choices=["sl", "lo", "dho"])
     
     args = parser.parse_args()
     

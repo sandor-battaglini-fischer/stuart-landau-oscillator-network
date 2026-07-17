@@ -43,7 +43,7 @@ TASKS: dict[str, TaskConfig] = {
         name="IMDB",
         script="training/train_imdb.py",
         output_glob="results/imdb/*",
-        metric_label=r"test accuracy ($\%$)",
+        metric_label=r"Test accuracy ($\%$)",
         omega_center=0.035904,
         omega_min=1.0,
         omega_max=10.0,
@@ -61,14 +61,14 @@ TASKS: dict[str, TaskConfig] = {
             "--lambda-param", "-0.05",
             "--gamma-real", "-0.1",
             "--gamma-imag", "0.1",
-            "--skip-epoch-plots",
+            "--sweep-mode",
         ],
     ),
     "smnist": TaskConfig(
         name="sMNIST",
         script="training/train_smnist.py",
         output_glob="results/smnist/*",
-        metric_label=r"test accuracy ($\%$)",
+        metric_label=r"Test accuracy ($\%$)",
         omega_center=0.224,
         omega_min=0.0,
         omega_max=1.0,
@@ -81,14 +81,14 @@ TASKS: dict[str, TaskConfig] = {
             "--gamma-imag", "0.0",
             "--epochs", "10",
             "--num-hidden", "128",
-            "--skip-epoch-plots",
+            "--sweep-mode",
         ],
     ),
     "mackey_glass": TaskConfig(
         name="Mackey-Glass",
         script="training/train_mackey_glass.py",
         output_glob="results/mackey_glass/*",
-        metric_label=r"test $R^2$",
+        metric_label=r"Test $R^2$",
         omega_center=0.15,
         omega_min=0.0,
         omega_max=1.0,
@@ -103,17 +103,17 @@ TASKS: dict[str, TaskConfig] = {
             "--lambda-param", "-0.1",
             "--gamma-real", "-0.1",
             "--gamma-imag", "0.0",
-            "--mg-tau", "34.0",
+            "--mg-tau", "17.0",
             "--horizon", "1",
             "--series-length", "20000",
             "--val-fraction", "0.1",
             "--test-fraction", "0.1",
-            "--lr", "1e-2",
+            "--lr", "1e-4",
             "--batch-size", "64",
             "--seed", "1",
             "--lr-decay-power", "1.0",
             "--min-lr-ratio", "0.0",
-            "--skip-epoch-plots",
+            "--sweep-mode",
         ],
     ),
 }
@@ -361,53 +361,48 @@ def run_single(
 
 
 def plot_results(results: dict, plot_path: Path) -> None:
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+    n_tasks = len(TASKS)
+    fig, axes = plt.subplots(n_tasks, 1, figsize=(7, 3.2 * n_tasks), sharex=True)
+    if n_tasks == 1:
+        axes = [axes]
     colors = {
-        "imdb": thesis_blue,
-        "smnist": ifisc_green,
-        "mackey_glass": thesis_red,
+        "imdb": "black",
+        "smnist": "black",
+        "mackey_glass": "black",
     }
 
     for ax, (task_key, task) in zip(axes, TASKS.items()):
         summary = aggregate_task_results(results.get(task_key, []))
         if not summary:
-            ax.set_title(f"{task.name}\n(no successful runs)")
-            ax.set_xlabel(r"$\omega$")
+            ax.set_title(f"{task.name} (no successful runs)", loc="left")
             continue
 
         omegas = [row["omega"] for row in summary]
         means = [row["mean"] for row in summary]
         ci95 = [row["ci95"] for row in summary]
-        stds = [row["std"] for row in summary]
         color = colors[task_key]
 
         lower_ci = [m - c for m, c in zip(means, ci95)]
         upper_ci = [m + c for m, c in zip(means, ci95)]
-        lower_std = [m - s for m, s in zip(means, stds)]
-        upper_std = [m + s for m, s in zip(means, stds)]
 
-        ax.fill_between(omegas, lower_std, upper_std, color=color, alpha=0.15, linewidth=0)
-        ax.fill_between(omegas, lower_ci, upper_ci, color=color, alpha=0.25, linewidth=0)
+        ax.fill_between(
+            omegas, lower_ci, upper_ci, color=color, alpha=0.25, linewidth=0, label="$95\\%$ CI"
+        )
         ax.plot(omegas, means, "o-", color=color, linewidth=2, markersize=5, label="mean")
         ax.axvline(task.omega_center, color=color, linestyle="--", alpha=0.5, linewidth=1)
 
-        n_runs = summary[0]["n_runs"]
-        # ax.set_title(f"{task.name}\n({n_runs} runs per $\\omega$)")
+        ax.set_title(task.name, loc="left")
         ax.set_ylabel(task.metric_label)
-        ax.set_xlabel(r"$\omega$")
         ax.grid(True, alpha=0.3)
         if task_key == "mackey_glass":
             ax.set_ylim(0.0, 1.0)
         else:
             ax.set_ylim(50.0, 100.0)
+        ax.legend(loc="lower left", frameon=True, fontsize=14)
 
-    handles = [
-        plt.Line2D([0], [0], color="gray", linewidth=2, marker="o", label="mean"),
-        plt.Rectangle((0, 0), 1, 1, facecolor="gray", alpha=0.25, label="$95\%$ CI"),
-        plt.Rectangle((0, 0), 1, 1, facecolor="gray", alpha=0.15, label=r"$\pm 1\sigma$"),
-    ]
-    fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 1.08), ncol=3, frameon=False)
-    fig.suptitle("Performance vs natural frequency $\\omega$", y=1.14)
+    axes[-1].set_xlabel(r"$\omega$")
+
+    fig.suptitle("Performance vs natural frequency $\\omega$", y=1.02)
     fig.tight_layout()
     plot_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(plot_path, dpi=200, bbox_inches="tight")
@@ -486,7 +481,7 @@ def main() -> None:
 
     if args.with_manifold:
         for task in TASKS.values():
-            task.base_cmd = [c for c in task.base_cmd if c != "--skip-epoch-plots"]
+            task.base_cmd = [c for c in task.base_cmd if c != "--sweep-mode"]
 
     if not args.plot_only:
         task_grids = {

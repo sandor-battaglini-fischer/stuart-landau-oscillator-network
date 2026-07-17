@@ -1,30 +1,30 @@
+#!/usr/bin/env python3
+"""Plot nonlinearity ablation curves from legacy runs or multi-seed sweep results."""
+
+from __future__ import annotations
+
+import argparse
 import json
+import sys
 from pathlib import Path
 
-import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-import os
-import sys
+import numpy as np
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
 
-from utils.plotting_utils.style import apply_style, thesis_red, thesis_blue, ifisc_green, mycmap
+from experiments.sweeps.nonlinearity_ablation_sweep import ABLATION_COLORS, VARIANTS, ablation_colors_for
+from experiments.sweeps.sweep_common import (
+    RANDOM_GUESS_BASELINE,
+    add_stats_legend,
+    aggregate_epoch_curves,
+    load_results,
+    plot_epoch_curves_with_stats,
+)
+from utils.plotting_utils.style import apply_style
+
 apply_style()
-
-
-thesis_blue = (0, 0.38, 0.68)
-red_light = (0.85, 0.45, 0.5)
-blue_light = (0.45, 0.65, 0.88)
-
-ABLATION_COLORS = [
-    thesis_red,
-    red_light,
-    thesis_blue,
-    blue_light,
-]
 
 ABLATION_RUNS = {
     "imdb": {
@@ -47,17 +47,24 @@ ABLATION_RUNS = {
     },
 }
 
+SWEEP_TASK_MAP = {
+    "imdb": "imdb",
+    "smnist": "smnist",
+    "mg": "mackey_glass",
+}
+
+
 def parse_imdb_log(log_path: Path):
     if not log_path.exists():
         return None
     epochs = []
     test_accuracies = []
-    with open(log_path, 'r') as f:
+    with open(log_path) as f:
         for line in f:
             line = line.strip()
-            if not line or not line.startswith('epoch'):
+            if not line or not line.startswith("epoch"):
                 continue
-            parts = line.split(':', 1)
+            parts = line.split(":", 1)
             if len(parts) != 2:
                 continue
             epoch_parts = parts[0].split()
@@ -67,10 +74,9 @@ def parse_imdb_log(log_path: Path):
                 epoch = int(epoch_parts[1])
             except (ValueError, IndexError):
                 continue
-            rest = parts[1].strip()
-            for part in rest.split(','):
-                if 'test:' in part:
-                    test_value_str = part.strip().split(':', 1)[1].strip().split()[0]
+            for part in parts[1].strip().split(","):
+                if "test:" in part:
+                    test_value_str = part.strip().split(":", 1)[1].strip().split()[0]
                     test_accuracies.append(float(test_value_str))
                     epochs.append(epoch)
                     break
@@ -80,44 +86,14 @@ def parse_imdb_log(log_path: Path):
     return np.asarray([x[1] for x in sorted_data], dtype=float)
 
 
-def parse_smnist_log(log_path: Path):
-    if not log_path.exists():
-        return None
-    epochs = []
-    test_accuracies = []
-    with open(log_path, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if not line or not line.startswith('epoch'):
-                continue
-            parts = line.split(':', 1)
-            if len(parts) != 2:
-                continue
-            epoch_parts = parts[0].split()
-            if len(epoch_parts) < 2:
-                continue
-            try:
-                epoch = int(epoch_parts[1])
-            except (ValueError, IndexError):
-                continue
-            rest = parts[1].strip()
-            for part in rest.split(','):
-                if 'test:' in part:
-                    test_value_str = part.strip().split(':', 1)[1].strip().split()[0]
-                    test_accuracies.append(float(test_value_str))
-                    epochs.append(epoch)
-                    break
-    if not test_accuracies or len(epochs) != len(test_accuracies):
-        return None
-    sorted_data = sorted(zip(epochs, test_accuracies))
-    return np.asarray([x[1] for x in sorted_data], dtype=float)
+parse_smnist_log = parse_imdb_log
 
 
 def load_mg_run_metrics(run_path: Path):
     metrics_path = run_path / "metrics.json"
     if not metrics_path.exists():
         return None
-    with open(metrics_path, "r") as f:
+    with metrics_path.open() as f:
         data = json.load(f)
     if not data:
         return None
@@ -130,6 +106,7 @@ def find_run_dir(base_dir: Path, run_name: str) -> Path | None:
         base_dir,
         base_dir / "Nonlinearity Ablation runs",
         base_dir / "runs-old",
+        REPO_ROOT,
     )
     for parent in search_roots:
         candidate = parent / run_name
@@ -138,7 +115,7 @@ def find_run_dir(base_dir: Path, run_name: str) -> Path | None:
     return None
 
 
-def plot_ablation_ta(series_by_label, task_name: str, output_path: Path, use_r2: bool):
+def plot_ablation_legacy(series_by_label, task_name: str, output_path: Path, use_r2: bool):
     if not series_by_label:
         print(f"  No data for {task_name}, skipping.")
         return
@@ -166,9 +143,80 @@ def plot_ablation_ta(series_by_label, task_name: str, output_path: Path, use_r2:
     print(f"Saved plot to {output_path}")
 
 
+def plot_ablation_from_sweep(results: dict, task_name: str, output_path: Path, use_r2: bool):
+    sweep_key = SWEEP_TASK_MAP[task_name]
+    curves = aggregate_epoch_curves(results.get(sweep_key, []), "variant")
+    if not curves:
+        print(f"  No sweep data for {task_name}, skipping.")
+        return
+
+    variant_order = list(VARIANTS.keys())
+    ordered = {k: curves[k] for k in variant_order if k in curves}
+
+    if use_r2:
+        ordered = {
+            label: {
+                **stats,
+                "mean": stats["mean"] * 100,
+                "std": stats["std"] * 100,
+                "ci95": stats["ci95"] * 100,
+            }
+            for label, stats in ordered.items()
+        }
+
+    guess = RANDOM_GUESS_BASELINE.get(task_name, 0.0)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ordered_keys = list(ordered.keys())
+    plot_epoch_curves_with_stats(
+        ax,
+        ordered,
+        ablation_colors_for(ordered_keys),
+        labels=ordered_keys,
+        ylabel=r"test $R^2$ (\%)" if use_r2 else r"test accuracy ($\%$)",
+        ylim=None if use_r2 else (guess, 100.0),
+        random_guess=guess if not use_r2 else 0.0,
+    )
+    title_map = {"imdb": "IMDb", "smnist": "sMNIST", "mg": "Mackey-Glass"}
+    ax.set_title(f"{title_map.get(task_name, task_name)}: nonlinearity ablation")
+    add_stats_legend(fig, y=1.02)
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"Saved plot to {output_path}")
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Plot nonlinearity ablation training curves.")
+    parser.add_argument(
+        "--sweep-dir",
+        type=str,
+        default=None,
+        help="Path to nonlinearity_ablation_sweep results (uses multi-seed statistics)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Output directory for plots (default: comparison_plots_final or sweep dir)",
+    )
+    args = parser.parse_args()
+
     base_dir = Path(__file__).parent
-    output_dir = base_dir / "comparison_plots_final"
+    if args.sweep_dir:
+        sweep_dir = Path(args.sweep_dir)
+        results_path = sweep_dir / "results.json"
+        results = load_results(results_path, list(SWEEP_TASK_MAP.values()))
+        output_dir = Path(args.output_dir) if args.output_dir else sweep_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for task in ABLATION_RUNS:
+            use_r2 = task == "mg"
+            out_name = f"{task}_ablation_ta.png"
+            plot_ablation_from_sweep(results, task, output_dir / out_name, use_r2=use_r2)
+        print("\nAll ablation plots generated from sweep results.")
+        return
+
+    output_dir = Path(args.output_dir) if args.output_dir else base_dir / "comparison_plots_final"
     output_dir.mkdir(exist_ok=True)
 
     for task, run_map in ABLATION_RUNS.items():
@@ -193,7 +241,7 @@ def main():
             series_by_label[label] = data
         use_r2 = task == "mg"
         out_name = f"{task}_ablation_ta.png"
-        plot_ablation_ta(series_by_label, task, output_dir / out_name, use_r2=use_r2)
+        plot_ablation_legacy(series_by_label, task, output_dir / out_name, use_r2=use_r2)
     print("\nAll ablation TA plots generated.")
 
 

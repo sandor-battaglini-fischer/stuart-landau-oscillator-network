@@ -16,11 +16,14 @@ def extract_model_parameters(model, dynamics_type):
         "h2o_bias": core.h2o.bias.detach().cpu().numpy().tolist(),
     }
 
-    if dynamics_type == "sl":
+    if dynamics_type in ("sl", "lo"):
         params["lambda_param"] = core.lambda_param.detach().cpu().numpy().tolist() if isinstance(core.lambda_param, torch.Tensor) else [core.lambda_param]
         params["omega_param"] = core.omega_param.detach().cpu().numpy().tolist() if isinstance(core.omega_param, torch.Tensor) else [core.omega_param]
         params["gamma_real"] = core.gamma_real.detach().cpu().numpy().tolist() if isinstance(core.gamma_real, torch.Tensor) else [core.gamma_real]
         params["gamma_imag"] = core.gamma_imag.detach().cpu().numpy().tolist() if isinstance(core.gamma_imag, torch.Tensor) else [core.gamma_imag]
+    elif dynamics_type == "dho":
+        params["omega"] = float(core.omega)
+        params["gamma"] = float(core.gamma)
 
     params["h"] = float(core.h)
     params["alpha"] = float(core.alpha)

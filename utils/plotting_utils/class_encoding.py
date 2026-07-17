@@ -102,6 +102,7 @@ def plot_digit_encoding_analysis(
         plot_autocorrelation_analysis,
         plot_decision_drivers,
         plot_granular_stage_spectra,
+        plot_node_activity_analysis,
         plot_phase_vs_magnitude_separation,
         plot_real_imag_spectrum_comparison,
         save_signal_analysis_summary,
@@ -128,6 +129,13 @@ def plot_digit_encoding_analysis(
         title_suffix="sMNIST digit encoding: spectra at each processing stage",
     )
     plot_real_imag_spectrum_comparison(stages_by_class, output_dir, epoch, "digit", unit_indices, colors)
+    node_summary = plot_node_activity_analysis(
+        stages_by_class,
+        output_dir,
+        epoch,
+        prefix="digit",
+        title_suffix="sMNIST digit encoding",
+    )
     plot_autocorrelation_analysis(
         stages_by_class,
         output_dir,
@@ -175,6 +183,7 @@ def plot_digit_encoding_analysis(
         "per_digit_mean_final_z_imag": {
             str(d): _json_float(np.nanmean(features_by_class[d]["final_z_imag"])) for d in all_digits
         },
+        "node_activity": node_summary,
         **separation_summary,
     }
     if not dynamics_finite:

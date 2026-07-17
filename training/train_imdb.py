@@ -23,7 +23,7 @@ sys.path.append(PROJECT_ROOT)
 DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
 TASK = 'imdb'
 
-from models import SLON
+from utils.model_factory import build_oscillator, manifold_dynamics_type
 
 from utils.run_dirs import make_run_dir, sweep_summary_path, epoch_dir, save_training_checkpoint
 from utils.slon_analysis import extract_model_parameters, compute_parameter_statistics
@@ -49,12 +49,14 @@ parser.add_argument('--shuffle', action = 'store_true', help='whether to shuffle
 parser.add_argument('--seed', type=int, default=1, help='random seed')
 parser.add_argument('--lr', type=float, default=1e-3, help='learning rate')
 parser.add_argument('--h', type=float, default=1.0, help='microscopic time constant h (default: 1)')
-parser.add_argument('--alpha', type=float, default=0.04, help='excitability coefficient alpha')
+parser.add_argument('--alpha', type=float, default=0.5, help='excitability coefficient alpha')
 parser.add_argument('--omega', type=float, default=0.224, help='natural frequency omega')
 parser.add_argument('--gamma', type=float, default=0.01, help='damping coefficient gamma')
 parser.add_argument('--lambda-param', type=float, default=-0.05, help='Stuart-Landau: real part of linear coefficient lambda (default: -|gamma|)')
 parser.add_argument('--gamma-real', type=float, default=-0.1, help='Stuart-Landau: real part of nonlinear coefficient (default: -0.1)')
 parser.add_argument('--gamma-imag', type=float, default=0.1, help='Stuart-Landau: imaginary part of nonlinear coefficient (default: 0.1)')
+parser.add_argument('--dynamics', type=str, default='sl', choices=['sl', 'lo', 'dho'], help='oscillator dynamics: sl (Stuart-Landau), lo (linear SL), or dho (damped harmonic)')
+parser.add_argument('--no-tanh', action='store_true', help='use linear input coupling instead of tanh')
 parser.add_argument('--embed-dim', type=int, default=100, help='word embedding dimension')
 parser.add_argument('--max-len', type=int, default=175, help='maximum sequence length (truncate/pad to this)')
 parser.add_argument('--min-freq', type=int, default=2, help='minimum word frequency for vocabulary')
@@ -85,6 +87,10 @@ parser.add_argument('--analyze-manifold', action='store_true', default=True,
                     help='Enable manifold dimension analysis (runs at end of training and every 10 epochs)')
 parser.add_argument('--skip-epoch-plots', action='store_true',
                     help='Skip per-epoch plots and manifold analysis (metrics still saved)')
+parser.add_argument('--sweep-mode', action='store_true',
+                    help='Minimal sweep outputs: only log.txt (parameters + metrics) and metrics.json')
+parser.add_argument('--output-dir', type=str, default=None,
+                    help='Explicit output directory for this run (overrides timestamped default)')
 parser.add_argument('--sentiment-analysis-examples', type=int, default=100,
                     help='number of positive/negative test reviews for sentiment encoding analysis')
 
@@ -309,7 +315,7 @@ def load_glove_vectors(glove_path, vocab, embed_dim):
 
 # wrapper model that includes embedding layer
 class SLONWithEmbedding(nn.Module):
-    def __init__(self, vocab_size, embed_dim, num_hidden, num_output, h, alpha, omega, gamma, pad_idx, dropout=0.0, embedding_weights=None, lambda_param=None, gamma_real=None, gamma_imag=None):
+    def __init__(self, vocab_size, embed_dim, num_hidden, num_output, h, alpha, omega, gamma, pad_idx, dropout=0.0, embedding_weights=None, lambda_param=None, gamma_real=None, gamma_imag=None, dynamics='sl', use_tanh=True):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_idx)
         
@@ -322,7 +328,11 @@ class SLONWithEmbedding(nn.Module):
         
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         
-        self.slon = SLON(embed_dim, num_hidden, num_output, h, alpha, omega, gamma, lambda_param=lambda_param, gamma_real=gamma_real, gamma_imag=gamma_imag)
+        self.slon = build_oscillator(
+            dynamics, embed_dim, num_hidden, num_output, h, alpha, omega, gamma,
+            lambda_param=lambda_param, gamma_real=gamma_real, gamma_imag=gamma_imag,
+            use_tanh=use_tanh,
+        )
     
     def forward(self, token_ids, random_init=None, record=False):
         embedded = self.embedding(token_ids)
@@ -334,6 +344,9 @@ class SLONWithEmbedding(nn.Module):
 
 if __name__ == '__main__':
     args = parser.parse_args()
+
+    if args.sweep_mode:
+        args.skip_epoch_plots = True
 
     def resolve_data_path(path):
         if os.path.isabs(path):
@@ -355,7 +368,7 @@ if __name__ == '__main__':
 
     print(args)
 
-    print("Using Stuart-Landau dynamics")
+    print(f"Using {args.dynamics} dynamics")
 
     # fix seed
     torch.manual_seed(args.seed)
@@ -493,7 +506,8 @@ if __name__ == '__main__':
         model = SLONWithEmbedding(vocab_size, dim_input, args.num_hidden, dim_output, 
                                   args.h, args.alpha, omega_value, args.gamma, pad_idx, 
                                   dropout=args.dropout, embedding_weights=embedding_weights,
-                                  lambda_param=lambda_param, gamma_real=gamma_real_param, gamma_imag=gamma_imag_param)
+                                  lambda_param=lambda_param, gamma_real=gamma_real_param, gamma_imag=gamma_imag_param,
+                                  dynamics=args.dynamics, use_tanh=not args.no_tanh)
 
         loss = torch.nn.CrossEntropyLoss()
 
@@ -507,7 +521,10 @@ if __name__ == '__main__':
         )
 
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        if sweep_idx is not None:
+        if args.output_dir is not None:
+            output_dir = args.output_dir
+            os.makedirs(output_dir, exist_ok=True)
+        elif sweep_idx is not None:
             if sweep_type == 'omega':
                 sweep_suffix = f'omega{omega_value:.6f}'
             elif sweep_type == 'lambda':
@@ -526,7 +543,8 @@ if __name__ == '__main__':
         fh_log.write('='*60 + '\n')
         fh_log.write('Training Parameters\n')
         fh_log.write('='*60 + '\n')
-        fh_log.write(f'dynamics: sl (Stuart-Landau)\n')
+        fh_log.write(f'dynamics: {args.dynamics}\n')
+        fh_log.write(f'use_tanh: {not args.no_tanh}\n')
         fh_log.write(f'num_hidden: {args.num_hidden}\n')
         fh_log.write(f'epochs: {args.epochs}\n')
         fh_log.write(f'batch_size: {args.batch_size}\n')
@@ -569,7 +587,7 @@ if __name__ == '__main__':
                     token_ids = token_ids[:, perm]
 
                 # run model inference - record dynamics for first batch when epoch and batch are provided
-                record_dynamics = (i == 0 and epoch is not None and batch is not None)
+                record_dynamics = (i == 0 and epoch is not None and batch is not None and not args.sweep_mode)
                 output = model(token_ids, record=record_dynamics)
                 prediction = output['output']
 
@@ -644,11 +662,12 @@ if __name__ == '__main__':
         if gamma_imag_value is not None:
             param_str += f', gamma_imag={gamma_imag_value:.6f}'
 
-        example_token_ids, example_label = next(iter(test_loader))
-        example_token_ids = example_token_ids[0:1]
-        example_label = int(example_label[0].item())
-
+        example_token_ids, example_label = None, None
         if not args.skip_epoch_plots:
+            example_token_ids, example_label = next(iter(test_loader))
+            example_token_ids = example_token_ids[0:1]
+            example_label = int(example_label[0].item())
+
             sentiment_examples = find_class_examples(test_loader, labels=(0, 1))
             neg_example_token_ids = sentiment_examples[0]
             pos_example_token_ids = sentiment_examples[1]
@@ -752,20 +771,21 @@ if __name__ == '__main__':
             val_losses.append(val_loss_avg)
             test_losses.append(test_loss_avg)
 
-            model_params = extract_model_parameters(model, 'sl')
-            param_stats = compute_parameter_statistics(model_params)
-            parameters_history.append({
-                "epoch": epoch,
-                "params": model_params,
-                "stats": param_stats
-            })
+            if not args.sweep_mode:
+                model_params = extract_model_parameters(model, args.dynamics)
+                param_stats = compute_parameter_statistics(model_params)
+                parameters_history.append({
+                    "epoch": epoch,
+                    "params": model_params,
+                    "stats": param_stats
+                })
 
-            params_file = f'{output_dir}/parameters.json'
-            with open(params_file, 'w') as f:
-                json.dump(parameters_history, f, indent=2)
+                params_file = f'{output_dir}/parameters.json'
+                with open(params_file, 'w') as f:
+                    json.dump(parameters_history, f, indent=2)
 
-            ep_dir = epoch_dir(output_dir, epoch)
             if not args.skip_epoch_plots:
+                ep_dir = epoch_dir(output_dir, epoch)
                 try:
                     cm = plot_classification_epoch(
                         output_dir=output_dir,
@@ -886,7 +906,7 @@ if __name__ == '__main__':
                     manifold_results_epoch = analyze_manifold_dimension(
                         test_loader,
                         model,
-                        'sl',
+                        manifold_dynamics_type(args.dynamics),
                         ep_dir,
                         epoch=epoch,
                         batch_size_test=batch_size_test,
@@ -902,8 +922,9 @@ if __name__ == '__main__':
                 except Exception as e:
                     tqdm.write(f"Warning: Manifold dimension analysis failed at epoch {epoch}: {e}")
 
-            save_training_checkpoint(model, output_dir, is_best=is_best)
-            tqdm.write(f'wrote checkpoint last_model.pt{" + best_model.pt" if is_best else ""}')
+            if not args.sweep_mode:
+                save_training_checkpoint(model, output_dir, is_best=is_best)
+                tqdm.write(f'wrote checkpoint last_model.pt{" + best_model.pt" if is_best else ""}')
 
             if patience_counter >= args.early_stop_patience:
                 tqdm.write(f'Early stopping at epoch {epoch}. Best validation: {best_eval:.4f} at epoch {best_epoch}')
@@ -930,7 +951,7 @@ if __name__ == '__main__':
                 manifold_results = analyze_manifold_dimension(
                     test_loader,
                     model,
-                    'sl',
+                    manifold_dynamics_type(args.dynamics),
                     output_dir,
                     epoch=None,
                     batch_size_test=batch_size_test,
@@ -975,7 +996,7 @@ if __name__ == '__main__':
                 collect_and_save_final_states(
                     test_loader,
                     model,
-                    'sl',
+                    manifold_dynamics_type(args.dynamics),
                     output_dir,
                     batch_size_test=batch_size_test,
                     max_samples=50000,

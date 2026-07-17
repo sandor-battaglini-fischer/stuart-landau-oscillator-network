@@ -11,6 +11,7 @@ from .sentiment_encoding import (
     _mean_over_units,
     _mean_std_spectrum,
     _plot_mean_std_band,
+    _rfft_amplitude,
 )
 from .style import thesis_blue, thesis_red, ifisc_green
 
@@ -24,6 +25,13 @@ SPECTRAL_STAGE_SPECS = [
     ("z_imag", r"$\Im(z)$"),
     ("z_magnitude", r"$|z|$"),
     ("z_phase", r"$\arg(z)$"),
+]
+
+NODE_ACTIVITY_STAGES = [
+    ("pre_activation", r"pre-activation $u(t)$"),
+    ("z_real", r"$\Re(z)$"),
+    ("z_imag", r"$\Im(z)$"),
+    ("z_magnitude", r"$|z|$"),
 ]
 
 
@@ -560,6 +568,212 @@ def plot_decision_drivers(features_by_group, output_dir, epoch, prefix, colors, 
     plt.tight_layout()
     fig.savefig(os.path.join(output_dir, _epoch_filename(f"{prefix}_decision_drivers", epoch)), transparent=True)
     plt.close(fig)
+
+
+def _node_activity_trace(stages, stage_key):
+    trace = stages[stage_key]
+    if stage_key == "raw_input":
+        return trace
+    if stage_key in ("z_real", "z_imag", "pre_activation"):
+        return np.abs(trace)
+    return trace
+
+
+def _class_mean_node_traces(groups, stage_key):
+    return {
+        label: _node_activity_trace(stages, stage_key).mean(axis=1)
+        for label, stages in groups.items()
+    }
+
+
+def _pooled_node_trace(groups, stage_key):
+    traces = [_node_activity_trace(stages, stage_key) for stages in groups.values()]
+    return np.concatenate(traces, axis=1).mean(axis=1)
+
+
+def _node_spectra_over_nodes(time_series):
+    return _rfft_amplitude(time_series).T
+
+
+def _plot_node_matrix_heatmap(matrix, x_tick_idx, x_tick_labels, xlabel, title, output_path, cbar_label, log_scale=False):
+    matrix = np.asarray(matrix, dtype=np.float64)
+    matrix = np.where(np.isfinite(matrix), matrix, 0.0)
+    num_nodes = matrix.shape[0]
+
+    fig, ax = plt.subplots(figsize=(13, max(4.0, 0.18 * num_nodes + 2.0)))
+    if log_scale:
+        positive = matrix[matrix > 0]
+        vmin = positive.min() if positive.size else 1e-6
+        vmax = matrix.max() if matrix.max() > 0 else 1.0
+        im = ax.imshow(
+            np.maximum(matrix, vmin),
+            aspect="auto",
+            origin="lower",
+            cmap="viridis",
+            norm=LogNorm(vmin=vmin, vmax=vmax),
+        )
+    else:
+        vmax = matrix.max() if matrix.size and matrix.max() > 0 else 1.0
+        im = ax.imshow(matrix, aspect="auto", origin="lower", cmap="magma", vmin=0.0, vmax=vmax)
+    ax.set_title(title)
+    ax.set_ylabel("node")
+    ax.set_xlabel(xlabel)
+    ax.set_yticks(range(num_nodes))
+    ax.set_yticklabels([str(i) for i in range(num_nodes)])
+    if x_tick_labels is not None:
+        ax.set_xticks(x_tick_idx)
+        ax.set_xticklabels(x_tick_labels, rotation=45, ha="right")
+    fig.colorbar(im, ax=ax, shrink=0.9, label=cbar_label)
+    plt.tight_layout()
+    fig.savefig(output_path, transparent=True)
+    plt.close(fig)
+
+
+def _per_node_class_separation(groups, stage_key):
+    traces = []
+    labels = []
+    group_labels = sorted(groups.keys())
+    label_to_idx = {label: idx for idx, label in enumerate(group_labels)}
+    for label, stages in zip(group_labels, [groups[l] for l in group_labels]):
+        trace = _node_activity_trace(stages, stage_key)
+        traces.append(trace)
+        labels.append(np.full(trace.shape[1], label_to_idx[label], dtype=np.int64))
+    data = np.concatenate(traces, axis=1)
+    labels = np.concatenate(labels)
+    num_nodes = data.shape[-1]
+    scores = np.zeros(num_nodes, dtype=np.float64)
+    for node in range(num_nodes):
+        node_values = data[:, :, node].mean(axis=0)
+        per_group = []
+        for label in group_labels:
+            label_idx = label_to_idx[label]
+            other = np.concatenate(
+                [node_values[labels == label_to_idx[other_label]] for other_label in group_labels if other_label != label]
+            )
+            own = node_values[labels == label_idx]
+            per_group.append(abs(_cohens_d(own, other)))
+        scores[node] = np.nanmean(per_group)
+    return scores
+
+
+def _top_node_time_series(groups, stage_key, num_examples=3):
+    digit = sorted(groups.keys())[0]
+    trace = _node_activity_trace(groups[digit], stage_key)
+    class_means = _class_mean_node_traces(groups, stage_key)
+    n_examples = min(num_examples, trace.shape[1])
+    t = np.arange(trace.shape[0])
+    return t, trace[:, :n_examples, :], class_means[digit], digit
+
+
+def plot_node_activity_analysis(groups, output_dir, epoch, prefix, title_suffix=""):
+    os.makedirs(output_dir, exist_ok=True)
+    num_timesteps = next(iter(groups.values()))["z_magnitude"].shape[0]
+    num_nodes = next(iter(groups.values()))["z_magnitude"].shape[-1]
+    freqs = np.fft.rfftfreq(num_timesteps, d=1.0)
+    freq_tick_idx, freq_tick_labels = _ticks_for_freqs(freqs)
+    time_tick_idx = np.linspace(0, num_timesteps - 1, min(8, num_timesteps), dtype=int)
+    time_tick_labels = [str(i) for i in time_tick_idx]
+
+    node_summary = {}
+    for stage_key, stage_label in NODE_ACTIVITY_STAGES:
+        safe_key = stage_key.replace("z_", "")
+        pooled = _pooled_node_trace(groups, stage_key)
+        class_means = _class_mean_node_traces(groups, stage_key)
+        class_stack = np.stack([class_means[label] for label in sorted(class_means.keys())], axis=0)
+
+        activity_map = pooled.T
+        class_diff_map = class_stack.std(axis=0).T
+        spectrum_map = _node_spectra_over_nodes(pooled)
+        class_spectra = np.stack([_rfft_amplitude(class_means[label]) for label in sorted(class_means.keys())], axis=0)
+        spectrum_class_diff = class_spectra.std(axis=0).T
+
+        suffix = f" ({title_suffix})" if title_suffix else ""
+        _plot_node_matrix_heatmap(
+            activity_map,
+            time_tick_idx,
+            time_tick_labels,
+            "time step",
+            f"{stage_label}: mean activity per node (all digits){suffix}",
+            os.path.join(output_dir, _epoch_filename(f"{prefix}_node_activity_{safe_key}", epoch)),
+            "mean activity",
+            log_scale=True,
+        )
+        _plot_node_matrix_heatmap(
+            class_diff_map,
+            time_tick_idx,
+            time_tick_labels,
+            "time step",
+            f"{stage_label}: cross-digit spread per node (where classes diverge){suffix}",
+            os.path.join(output_dir, _epoch_filename(f"{prefix}_node_class_diff_{safe_key}", epoch)),
+            "std across digit means",
+        )
+        _plot_node_matrix_heatmap(
+            spectrum_map,
+            freq_tick_idx,
+            freq_tick_labels,
+            "frequency",
+            f"{stage_label}: frequency content per node (pooled){suffix}",
+            os.path.join(output_dir, _epoch_filename(f"{prefix}_node_spectrum_{safe_key}", epoch)),
+            "FFT amplitude",
+            log_scale=True,
+        )
+        _plot_node_matrix_heatmap(
+            spectrum_class_diff,
+            freq_tick_idx,
+            freq_tick_labels,
+            "frequency",
+            f"{stage_label}: cross-digit spectral spread per node{suffix}",
+            os.path.join(output_dir, _epoch_filename(f"{prefix}_node_spectrum_class_diff_{safe_key}", epoch)),
+            "std across digit spectra",
+        )
+
+        separation = _per_node_class_separation(groups, stage_key)
+        activity_score = pooled.mean(axis=0)
+        node_summary[stage_key] = {
+            "top_active_nodes": [int(i) for i in np.argsort(activity_score)[::-1][:5]],
+            "top_discriminative_nodes": [int(i) for i in np.argsort(separation)[::-1][:5]],
+            "mean_class_separation": _json_float(np.nanmean(separation)),
+        }
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, max(3.5, 0.15 * num_nodes + 2.0)))
+        order = np.argsort(activity_score)[::-1]
+        axes[0].barh([str(i) for i in order[::-1]], activity_score[order[::-1]], color=thesis_blue, alpha=0.85)
+        axes[0].set_xlabel("mean activity")
+        axes[0].set_title(f"{stage_label}: node activity ranking")
+        order = np.argsort(separation)[::-1]
+        axes[1].barh([str(i) for i in order[::-1]], separation[order[::-1]], color=ifisc_green, alpha=0.85)
+        axes[1].set_xlabel("mean |one-vs-rest Cohen's $d$|")
+        axes[1].set_title(f"{stage_label}: node class-separation ranking")
+        plt.tight_layout()
+        fig.savefig(
+            os.path.join(output_dir, _epoch_filename(f"{prefix}_node_ranking_{safe_key}", epoch)),
+            transparent=True,
+        )
+        plt.close(fig)
+
+        top_nodes = node_summary[stage_key]["top_active_nodes"][: min(8, num_nodes)]
+        t, examples, class_mean, digit = _top_node_time_series(groups, stage_key)
+        fig, axes = plt.subplots(len(top_nodes), 1, figsize=(12, 2.2 * len(top_nodes)), sharex=True, squeeze=False)
+        for row, node in enumerate(top_nodes):
+            ax = axes[row, 0]
+            for col in range(examples.shape[1]):
+                ax.plot(t, examples[:, col, node], color=thesis_blue, alpha=0.35, linewidth=1.0)
+            ax.plot(t, class_mean[:, node], color=thesis_red, linewidth=2.0, label="digit mean")
+            ax.set_ylabel(f"node {node}")
+            values = np.concatenate([examples[:, :, node].reshape(-1), class_mean[:, node]])
+            margin = (values.max() - values.min()) * 0.05 if values.max() > values.min() else 0.05
+            ax.set_ylim(values.min() - margin, values.max() + margin)
+        axes[0, 0].legend(loc="upper right", fontsize=8)
+        axes[-1, 0].set_xlabel("time step")
+        fig.suptitle(f"{stage_label}: top active nodes (digit {digit} examples){suffix}", y=1.01)
+        plt.tight_layout()
+        fig.savefig(
+            os.path.join(output_dir, _epoch_filename(f"{prefix}_node_timeseries_top_{safe_key}", epoch)),
+            transparent=True,
+        )
+        plt.close(fig)
+
+    return node_summary
 
 
 def save_signal_analysis_summary(summary, output_dir, epoch, prefix):
