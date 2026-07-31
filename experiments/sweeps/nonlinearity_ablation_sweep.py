@@ -141,7 +141,8 @@ def remap_orphan_dho_to_lo(results: dict) -> int:
 
 def apply_variant_migrations(results: dict, *, convert_legacy_dho: bool = False) -> int:
     n = migrate_legacy_results(results, convert_legacy_dho=convert_legacy_dho)
-    n += remap_orphan_dho_to_lo(results)
+    if convert_legacy_dho:
+        n += remap_orphan_dho_to_lo(results)
     return n
 
 
@@ -300,12 +301,7 @@ def sync_task_from_runs(source_dir: Path, task_key: str) -> list[dict]:
 
 
 def load_task_results_from_logs(source_dir: Path, task_key: str) -> list[dict]:
-    entries = sync_task_from_runs(source_dir, task_key)
-    if entries:
-        remapped = remap_orphan_dho_to_lo({task_key: entries})
-        if remapped:
-            print(f"  Remapped {remapped} orphan DHO entries to LO for {task_key}")
-    return entries
+    return sync_task_from_runs(source_dir, task_key)
 
 
 def parse_combine_from(values: list[str]) -> dict[str, Path]:
@@ -415,11 +411,19 @@ def variant_cmd(
 
 
 def existing_completions(results: dict, task_key: str) -> set[tuple[str, int]]:
-    return {
-        (completion_variant(entry), int(entry.get("seed", 1)))
-        for entry in results.get(task_key, [])
-        if entry.get("status") == "ok"
-    }
+    done: set[tuple[str, int]] = set()
+    for entry in results.get(task_key, []):
+        if entry.get("status") != "ok":
+            continue
+        variant = entry.get(GROUP_KEY)
+        expected = VARIANTS.get(variant)
+        if expected is not None:
+            if entry.get("dynamics") != expected.dynamics:
+                continue
+            if entry.get("use_tanh") != expected.use_tanh:
+                continue
+        done.add((variant, int(entry.get("seed", 1))))
+    return done
 
 
 def run_single(
@@ -628,7 +632,7 @@ def main() -> None:
     else:
         results = load_results(results_path, list(TASKS.keys()))
         n_migrated = apply_variant_migrations(results, convert_legacy_dho=args.migrate_legacy)
-        if n_migrated and not args.plot_only:
+        if n_migrated and not args.plot_only and args.migrate_legacy:
             print(f"Updated {n_migrated} legacy/mislabeled entries (LO/DHO metadata)")
             save_results(results_path, results)
             save_csv(

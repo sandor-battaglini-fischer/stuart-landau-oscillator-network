@@ -26,6 +26,7 @@ from utils.plotting_utils.smnist_pixel_reconstruction import (
     build_digit_prototypes,
     evaluate_pixel_reconstruction,
     plot_pixel_reconstruction_epoch,
+    run_and_save_precision_truncation,
 )
 
 
@@ -70,6 +71,23 @@ def parse_args():
         type=int,
         default=8,
         help="number of test examples in reconstruction figure",
+    )
+    parser.add_argument(
+        "--precision-truncation",
+        action="store_true",
+        default=True,
+        help="after training, sweep decimal truncation of the final state before readout",
+    )
+    parser.add_argument(
+        "--no-precision-truncation",
+        action="store_true",
+        help="disable final-state precision truncation analysis",
+    )
+    parser.add_argument(
+        "--precision-decimals",
+        type=str,
+        default="8,6,4,3,2,1,0",
+        help="comma-separated decimal places to keep in the final state (e.g. 8,4,2,1,0)",
     )
     return parser.parse_args()
 
@@ -149,6 +167,10 @@ def train_with_params(args, omega_value, lambda_value=None, sweep_idx=None, swee
     fh_log.write(f"omega: {omega_value:.6f}\n")
     fh_log.write(f"lambda: {lambda_param:.6f}\n")
     fh_log.write(f"num_output: {NUM_PIXELS}\n")
+    fh_log.write(
+        "early/late pixel definition: early = first 196 scan indices "
+        "(top 7 rows of 28x28); late = last 196 (bottom 7 rows)\n"
+    )
     fh_log.write("=" * 60 + "\n")
     fh_log.flush()
 
@@ -181,6 +203,14 @@ def run_training(args, omega_value, lambda_value=None, sweep_idx=None, sweep_typ
 
     shuffle_perm = torch.randperm(NUM_PIXELS) if args.shuffle else None
     digit_prototypes = build_digit_prototypes(train_loader)
+    decimal_levels = [
+        int(x.strip()) for x in args.precision_decimals.split(",") if x.strip() != ""
+    ]
+    do_precision = (
+        not args.no_precision_truncation
+        and args.precision_truncation
+        and not args.sweep_mode
+    )
 
     model, loss_fn, optimizer, fh_log, output_dir = train_with_params(
         args, omega_value, lambda_value, sweep_idx, sweep_type
@@ -292,6 +322,29 @@ def run_training(args, omega_value, lambda_value=None, sweep_idx=None, sweep_typ
                 num_examples=args.reconstruction_examples,
                 is_last_epoch=(epoch == args.epochs - 1),
             )
+            if do_precision:
+                _, trunc_summary = run_and_save_precision_truncation(
+                    test_loader,
+                    model,
+                    ep_dir,
+                    decimal_levels=decimal_levels,
+                    shuffle_perm=shuffle_perm,
+                    pixel_threshold=args.pixel_threshold,
+                    epoch=epoch,
+                    fh_log=None,
+                    promote_to_dir=output_dir if epoch == args.epochs - 1 else None,
+                )
+                coarsest = trunc_summary["labels"][-1]
+                fh_log.write(
+                    f"precision truncation epoch {epoch}: "
+                    f"full_r2={trunc_summary['overall_r2'][0]:.4f}, "
+                    f"decimals={coarsest}_r2={trunc_summary['overall_r2'][-1]:.4f}, "
+                    f"full_early_acc={trunc_summary['early_pixel_acc'][0]:.4f}, "
+                    f"full_late_acc={trunc_summary['late_pixel_acc'][0]:.4f}, "
+                    f"decimals={coarsest}_early_acc={trunc_summary['early_pixel_acc'][-1]:.4f}, "
+                    f"decimals={coarsest}_late_acc={trunc_summary['late_pixel_acc'][-1]:.4f}\n"
+                )
+                fh_log.flush()
 
         metrics_data = {
             "epoch": epoch,
@@ -343,6 +396,28 @@ def run_training(args, omega_value, lambda_value=None, sweep_idx=None, sweep_typ
         if not args.sweep_mode:
             save_training_checkpoint(model, output_dir, is_best=is_best)
 
+    if do_precision and args.skip_epoch_plots:
+        tqdm.write("Running final-state precision truncation analysis (best checkpoint)...")
+        best_path = os.path.join(output_dir, "best_model.pt")
+        last_path = os.path.join(output_dir, "last_model.pt")
+        ckpt_path = best_path if os.path.exists(best_path) else last_path
+        if os.path.exists(ckpt_path):
+            model.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
+        run_and_save_precision_truncation(
+            test_loader,
+            model,
+            output_dir,
+            decimal_levels=decimal_levels,
+            shuffle_perm=shuffle_perm,
+            pixel_threshold=args.pixel_threshold,
+            fh_log=fh_log,
+        )
+        tqdm.write(f"Precision truncation results saved under {output_dir}")
+    elif do_precision:
+        tqdm.write(
+            "Per-epoch precision truncation plots saved under epochs/; "
+            "final epoch also promoted to run root."
+        )
     summary = {
         "best_val_r2": best_val_r2,
         "best_test_r2": best_test_r2,

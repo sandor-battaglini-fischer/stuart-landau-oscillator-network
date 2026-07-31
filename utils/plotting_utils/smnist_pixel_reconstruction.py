@@ -1,3 +1,4 @@
+import json
 import os
 
 import matplotlib.pyplot as plt
@@ -5,6 +6,9 @@ import numpy as np
 import torch
 
 from .style import ifisc_green, thesis_blue, thesis_red
+
+EARLY_PIXEL_N = 196  # first 7 rows in row-major scan (28*7)
+LATE_PIXEL_N = 196   # last 7 rows in row-major scan (28*7)
 
 
 def prepare_smnist_sequence(images, shuffle_perm=None):
@@ -465,3 +469,326 @@ def plot_pixel_reconstruction_epoch(
     plt.close(fig)
 
     return test_metrics, confusion_matrix
+
+
+def truncate_decimals(x, n_decimals):
+    if n_decimals is None:
+        return x
+    scale = 10.0 ** int(n_decimals)
+    return torch.round(x * scale) / scale
+
+
+def _oscillator_core(model):
+    return model.slon if hasattr(model, "slon") else model
+
+
+def extract_final_features(model, inputs):
+    core = _oscillator_core(model)
+    out = core(inputs, record=True)
+    if "rec_z_real" in out and out["rec_z_real"] is not None:
+        z_real = out["rec_z_real"][:, -1, :]
+        z_imag = out["rec_z_imag"][:, -1, :]
+        return torch.cat([z_real, z_imag], dim=1)
+    if "rec_x_t" in out and out["rec_x_t"] is not None:
+        return out["rec_x_t"][:, -1, :]
+    raise ValueError("Model did not return recorded final-state features")
+
+
+def collect_final_features_and_targets(data_loader, model, shuffle_perm=None):
+    model.eval()
+    all_features = []
+    all_targets = []
+    all_labels = []
+
+    with torch.no_grad():
+        for images, labels in data_loader:
+            inputs = prepare_smnist_sequence(images, shuffle_perm)
+            targets = flatten_targets(images)
+            features = extract_final_features(model, inputs)
+            all_features.append(features.detach().cpu())
+            all_targets.append(targets.detach().cpu())
+            all_labels.append(labels.detach().cpu())
+
+    return (
+        torch.cat(all_features, dim=0),
+        torch.cat(all_targets, dim=0),
+        torch.cat(all_labels, dim=0).numpy(),
+    )
+
+
+def metrics_from_predictions(
+    preds,
+    targets,
+    labels=None,
+    pixel_threshold=0.1,
+    early_n=EARLY_PIXEL_N,
+    late_n=LATE_PIXEL_N,
+):
+    preds_np = preds.detach().cpu().numpy() if torch.is_tensor(preds) else np.asarray(preds)
+    targets_np = targets.detach().cpu().numpy() if torch.is_tensor(targets) else np.asarray(targets)
+    abs_err = np.abs(preds_np - targets_np)
+    per_pixel_mse = np.mean((preds_np - targets_np) ** 2, axis=0)
+    per_pixel_acc = np.mean(abs_err < pixel_threshold, axis=0)
+    per_pixel_r2 = np.array(
+        [compute_r2(targets_np[:, i], preds_np[:, i]) for i in range(preds_np.shape[1])],
+        dtype=np.float64,
+    )
+    result = {
+        "overall_mse": float(np.mean((preds_np - targets_np) ** 2)),
+        "overall_r2": float(compute_r2(targets_np.reshape(-1), preds_np.reshape(-1))),
+        "mean_pixel_acc": float(np.mean(per_pixel_acc)),
+        "early_pixel_acc": float(np.mean(per_pixel_acc[:early_n])),
+        "late_pixel_acc": float(np.mean(per_pixel_acc[-late_n:])),
+        "early_pixel_mse": float(np.mean(per_pixel_mse[:early_n])),
+        "late_pixel_mse": float(np.mean(per_pixel_mse[-late_n:])),
+        "per_pixel_mse": per_pixel_mse,
+        "per_pixel_acc": per_pixel_acc,
+        "per_pixel_r2": per_pixel_r2,
+        "preds": preds_np,
+        "targets": targets_np,
+    }
+    if labels is not None:
+        result["labels"] = np.asarray(labels)
+    return result
+
+
+def evaluate_precision_truncation(
+    data_loader,
+    model,
+    decimal_levels,
+    shuffle_perm=None,
+    pixel_threshold=0.1,
+    early_n=EARLY_PIXEL_N,
+    late_n=LATE_PIXEL_N,
+):
+    features, targets, labels = collect_final_features_and_targets(
+        data_loader, model, shuffle_perm=shuffle_perm
+    )
+    core = _oscillator_core(model)
+    h2o = core.h2o
+
+    sweep = []
+    levels = list(decimal_levels)
+    if None not in levels:
+        levels = [None] + levels
+
+    with torch.no_grad():
+        for n_decimals in levels:
+            truncated = truncate_decimals(features, n_decimals)
+            preds = h2o(truncated)
+            metrics = metrics_from_predictions(
+                preds,
+                targets,
+                labels=labels,
+                pixel_threshold=pixel_threshold,
+                early_n=early_n,
+                late_n=late_n,
+            )
+            metrics["n_decimals"] = n_decimals
+            metrics["label"] = "full" if n_decimals is None else str(int(n_decimals))
+            sweep.append(metrics)
+
+    return {
+        "levels": sweep,
+        "early_n": early_n,
+        "late_n": late_n,
+        "pixel_threshold": pixel_threshold,
+    }
+
+
+def plot_precision_truncation(sweep_result, output_dir, epoch=None):
+    os.makedirs(output_dir, exist_ok=True)
+    suffix = f"_epoch{epoch:02d}" if epoch is not None else ""
+    levels = sweep_result["levels"]
+
+    x_labels = [m["label"] for m in levels]
+    x = np.arange(len(levels))
+
+    overall_r2 = [m["overall_r2"] for m in levels]
+    overall_mse = [m["overall_mse"] for m in levels]
+    mean_acc = [m["mean_pixel_acc"] for m in levels]
+    early_acc = [m["early_pixel_acc"] for m in levels]
+    late_acc = [m["late_pixel_acc"] for m in levels]
+    early_mse = [m["early_pixel_mse"] for m in levels]
+    late_mse = [m["late_pixel_mse"] for m in levels]
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 11), sharex=True)
+
+    axes[0].plot(x, overall_r2, color=thesis_blue, marker="o", linewidth=2, label=r"overall $R^2$")
+    axes[0].set_ylabel(r"$R^2$")
+    axes[0].set_title("Reconstruction vs final-state decimal precision")
+    axes[0].legend(loc="best")
+
+    axes[1].plot(x, overall_mse, color=thesis_red, marker="o", linewidth=2, label="overall MSE")
+    axes[1].plot(
+        x,
+        early_mse,
+        color=thesis_blue,
+        marker="s",
+        linestyle="--",
+        label=f"early MSE (first {sweep_result['early_n']} px)",
+    )
+    axes[1].plot(
+        x,
+        late_mse,
+        color=ifisc_green,
+        marker="^",
+        linestyle="--",
+        label=f"late MSE (last {sweep_result['late_n']} px)",
+    )
+    axes[1].set_ylabel("MSE")
+    axes[1].legend(loc="best")
+
+    axes[2].plot(x, mean_acc, color="black", marker="o", linewidth=2, label="mean pixel acc")
+    axes[2].plot(
+        x,
+        early_acc,
+        color=thesis_blue,
+        marker="s",
+        linestyle="--",
+        label=f"early pixel acc (first {sweep_result['early_n']} px / top 7 rows)",
+    )
+    axes[2].plot(
+        x,
+        late_acc,
+        color=ifisc_green,
+        marker="^",
+        linestyle="--",
+        label=f"late pixel acc (last {sweep_result['late_n']} px / bottom 7 rows)",
+    )
+    axes[2].set_ylabel("accuracy")
+    axes[2].set_xlabel("kept decimals in final state (full = no truncation)")
+    axes[2].set_xticks(x)
+    axes[2].set_xticklabels(x_labels)
+    axes[2].set_ylim(0.0, 1.05)
+    axes[2].legend(loc="best")
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, f"precision_truncation{suffix}.png"), transparent=True)
+    plt.close(fig)
+
+    fig2, axes2 = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+    t = np.arange(784)
+    cmap = plt.get_cmap("viridis")
+    n_curves = len(levels)
+    for i, m in enumerate(levels):
+        color = cmap(i / max(n_curves - 1, 1))
+        label = f"decimals={m['label']}"
+        axes2[0].plot(t, m["per_pixel_acc"], color=color, linewidth=1.2, alpha=0.9, label=label)
+        axes2[1].plot(t, m["per_pixel_mse"], color=color, linewidth=1.2, alpha=0.9, label=label)
+    axes2[0].set_ylabel("accuracy")
+    axes2[0].set_title("Per-pixel accuracy vs scan index at truncated precision")
+    axes2[0].legend(loc="upper right", ncol=2, fontsize=11)
+    axes2[1].set_ylabel("MSE")
+    axes2[1].set_xlabel("pixel index (row-major scan)")
+    axes2[1].set_title("Per-pixel MSE vs scan index at truncated precision")
+    fig2.tight_layout()
+    fig2.savefig(os.path.join(output_dir, f"precision_truncation_vs_index{suffix}.png"), transparent=True)
+    plt.close(fig2)
+
+    return {
+        "n_decimals": [m["n_decimals"] for m in levels],
+        "labels": x_labels,
+        "overall_r2": overall_r2,
+        "overall_mse": overall_mse,
+        "mean_pixel_acc": mean_acc,
+        "early_pixel_acc": early_acc,
+        "late_pixel_acc": late_acc,
+        "early_pixel_mse": early_mse,
+        "late_pixel_mse": late_mse,
+    }
+
+
+def run_and_save_precision_truncation(
+    data_loader,
+    model,
+    output_dir,
+    decimal_levels,
+    shuffle_perm=None,
+    pixel_threshold=0.1,
+    epoch=None,
+    fh_log=None,
+    promote_to_dir=None,
+):
+    sweep_result = evaluate_precision_truncation(
+        data_loader,
+        model,
+        decimal_levels=decimal_levels,
+        shuffle_perm=shuffle_perm,
+        pixel_threshold=pixel_threshold,
+    )
+    summary = plot_precision_truncation(sweep_result, output_dir, epoch=epoch)
+
+    serializable = {
+        "epoch": epoch,
+        "pixel_threshold": sweep_result["pixel_threshold"],
+        "early_n": sweep_result["early_n"],
+        "late_n": sweep_result["late_n"],
+        "early_definition": (
+            f"mean over scan indices [0, {sweep_result['early_n']}) "
+            f"= first {sweep_result['early_n']} pixels = top {sweep_result['early_n'] // 28} rows"
+        ),
+        "late_definition": (
+            f"mean over scan indices [-{sweep_result['late_n']}:] "
+            f"= last {sweep_result['late_n']} pixels = bottom {sweep_result['late_n'] // 28} rows"
+        ),
+        "levels": [
+            {
+                "n_decimals": m["n_decimals"],
+                "label": m["label"],
+                "overall_mse": m["overall_mse"],
+                "overall_r2": m["overall_r2"],
+                "mean_pixel_acc": m["mean_pixel_acc"],
+                "early_pixel_acc": m["early_pixel_acc"],
+                "late_pixel_acc": m["late_pixel_acc"],
+                "early_pixel_mse": m["early_pixel_mse"],
+                "late_pixel_mse": m["late_pixel_mse"],
+            }
+            for m in sweep_result["levels"]
+        ],
+    }
+    json_name = (
+        f"precision_truncation_epoch{epoch:02d}.json"
+        if epoch is not None
+        else "precision_truncation.json"
+    )
+    out_json = os.path.join(output_dir, json_name)
+    with open(out_json, "w") as f:
+        json.dump(serializable, f, indent=2)
+
+    if promote_to_dir is not None:
+        import shutil
+
+        promote_map = {}
+        if epoch is not None:
+            promote_map = {
+                f"precision_truncation_epoch{epoch:02d}.png": "precision_truncation.png",
+                f"precision_truncation_vs_index_epoch{epoch:02d}.png": "precision_truncation_vs_index.png",
+                f"precision_truncation_epoch{epoch:02d}.json": "precision_truncation.json",
+            }
+        for src_name, dst_name in promote_map.items():
+            src = os.path.join(output_dir, src_name)
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(promote_to_dir, dst_name))
+
+    if fh_log is not None:
+        epoch_tag = f" epoch {epoch}" if epoch is not None else ""
+        fh_log.write("\n" + "=" * 60 + "\n")
+        fh_log.write(f"Final-state decimal precision truncation{epoch_tag}\n")
+        fh_log.write(
+            f"early = first {sweep_result['early_n']} scan indices "
+            f"(top {sweep_result['early_n'] // 28} rows); "
+            f"late = last {sweep_result['late_n']} "
+            f"(bottom {sweep_result['late_n'] // 28} rows)\n"
+        )
+        fh_log.write("=" * 60 + "\n")
+        for m in sweep_result["levels"]:
+            fh_log.write(
+                f"decimals={m['label']}: r2={m['overall_r2']:.4f}, mse={m['overall_mse']:.6f}, "
+                f"mean_acc={m['mean_pixel_acc']:.4f}, "
+                f"early_acc={m['early_pixel_acc']:.4f}, late_acc={m['late_pixel_acc']:.4f}\n"
+            )
+        fh_log.write("=" * 60 + "\n")
+        fh_log.flush()
+
+    return sweep_result, summary

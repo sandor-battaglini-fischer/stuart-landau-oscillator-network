@@ -143,19 +143,25 @@ def record_from_sweep_run_dir(
         if mg_metrics is None:
             return None
         record.update(mg_metrics)
-        record["metric"] = mg_metrics["test_r2"]
         curve = parse_epoch_metrics(metrics_path, "test_r2")
         if curve is not None:
             record["epoch_curve"] = curve
+        metric = scalar_metric_for_entry(record)
+        if metric is None:
+            return None
+        record["metric"] = metric
+        record["test_r2"] = metric
     else:
-        metric = classification_metric_from_logs(sweep_log_path, run_log_path, metrics_path)
         curve = parse_epoch_metrics(metrics_path, "test_acc") if metrics_path.is_file() else None
+        if curve is not None:
+            record["epoch_curve"] = curve
+        metric = scalar_metric_for_entry(record)
+        if metric is None:
+            metric = classification_metric_from_logs(sweep_log_path, run_log_path, metrics_path)
         if metric is None:
             return None
         record["metric"] = metric
         record["test_acc"] = metric
-        if curve is not None:
-            record["epoch_curve"] = curve
 
     record["status"] = "ok"
     return record
@@ -213,6 +219,16 @@ def parse_epoch_metrics(metrics_path: Path, metric_key: str) -> list[float] | No
     return [float(row[metric_key]) for row in rows if metric_key in row]
 
 
+def scalar_metric_for_entry(entry: dict, metric_key: str = "metric") -> float | None:
+    curve = entry.get("epoch_curve")
+    if curve:
+        return float(curve[-1])
+    value = entry.get(metric_key)
+    if value is None:
+        return None
+    return float(value)
+
+
 def load_results(results_path: Path, task_keys: list[str]) -> dict:
     if results_path.is_file():
         with results_path.open() as f:
@@ -258,12 +274,15 @@ def aggregate_scalar_results(
 ) -> list[dict]:
     by_group: dict[float | str, list[float]] = {}
     for entry in entries:
-        if entry.get("status") != "ok" or entry.get(metric_key) is None:
+        if entry.get("status") != "ok":
+            continue
+        metric = scalar_metric_for_entry(entry, metric_key)
+        if metric is None:
             continue
         key = entry[group_key]
         if isinstance(key, float):
             key = round(key, 10)
-        by_group.setdefault(key, []).append(float(entry[metric_key]))
+        by_group.setdefault(key, []).append(metric)
 
     summary = []
     for key in sorted(by_group, key=lambda v: (isinstance(v, str), v)):
@@ -408,27 +427,32 @@ def run_training_cmd(
             record["status"] = "parse_failed"
             return record
         record.update(mg_metrics)
-        record["metric"] = mg_metrics["test_r2"]
         curve = parse_epoch_metrics(metrics_path, "test_r2") if metrics_path else None
         if curve is not None:
             record["epoch_curve"] = curve
+        metric = scalar_metric_for_entry(record)
+        if metric is None:
+            record["status"] = "parse_failed"
+            return record
+        record["metric"] = metric
+        record["test_r2"] = metric
     else:
-        metric = parse_classification_metric(stdout)
         metrics_path = output_dir / "metrics.json" if output_dir else None
         curve = parse_epoch_metrics(metrics_path, "test_acc") if metrics_path else None
+        if curve is not None:
+            record["epoch_curve"] = curve
+        metric = scalar_metric_for_entry(record)
+        if metric is None:
+            metric = parse_classification_metric(stdout)
         if metric is None and output_dir is not None:
             log_file = output_dir / "log.txt"
             if log_file.is_file():
                 metric = parse_classification_metric(log_file.read_text())
-        if metric is None and curve:
-            metric = float(curve[-1])
         if metric is None:
             record["status"] = "parse_failed"
             return record
         record["metric"] = metric
         record["test_acc"] = metric
-        if curve is not None:
-            record["epoch_curve"] = curve
 
     record["status"] = "ok"
     return record

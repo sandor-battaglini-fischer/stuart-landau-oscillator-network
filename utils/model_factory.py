@@ -1,4 +1,22 @@
+import math
+
 DYNAMICS_CHOICES = ("sl", "lo", "dho")
+
+
+def dho_params_matching_linear_sl(omega, gamma, lambda_param=None):
+    """Map linear SL eigenvalues λ ± iω onto HORN's under/overdamped form.
+
+    HORN: ẍ + 2γẋ + Ω²x = F has poles -γ ± sqrt(γ² - Ω²).
+    Choosing γ = -λ and Ω = sqrt(ω² + γ²) yields poles λ ± iω.
+    If lambda_param is None, pass gamma/omega through unchanged.
+    """
+    if lambda_param is None:
+        return float(omega), float(gamma)
+    lam = float(lambda_param)
+    dho_gamma = -lam
+    om = float(omega)
+    dho_omega = math.sqrt(om * om + dho_gamma * dho_gamma)
+    return dho_omega, dho_gamma
 
 
 def build_oscillator(
@@ -23,14 +41,15 @@ def build_oscillator(
     if dynamics == "dho":
         from models.horn import HORN
 
+        dho_omega, dho_gamma = dho_params_matching_linear_sl(omega, gamma, lambda_param)
         return HORN(
             num_input,
             num_nodes,
             num_output,
             h,
             alpha,
-            omega,
-            gamma,
+            dho_omega,
+            dho_gamma,
             use_tanh=use_tanh,
         )
 
