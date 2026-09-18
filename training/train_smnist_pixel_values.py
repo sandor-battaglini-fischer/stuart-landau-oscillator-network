@@ -11,7 +11,7 @@ from tqdm import tqdm
 import sys
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(PROJECT_ROOT)
+sys.path.insert(0, PROJECT_ROOT)
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 TASK = "smnist_pixel_values"
 NUM_PIXELS = 784

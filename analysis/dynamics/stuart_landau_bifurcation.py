@@ -6,7 +6,7 @@ from matplotlib.patches import Patch
 import os
 import sys
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
@@ -333,9 +333,9 @@ def main():
     )
 
     legend_handles = [
-        Patch(facecolor=thesis_blue, label="fixed point"),
-        Patch(facecolor=ifisc_green, label="limit cycle"),
-        Patch(facecolor=thesis_red, label="divergent"),
+        Patch(facecolor=thesis_blue, label="Stable fixed point"),
+        Patch(facecolor=ifisc_green, label="Stable limit cycle"),
+        Patch(facecolor=thesis_red, label="Divergent limit cycle"),
     ]
     ax.legend(
         handles=legend_handles,
@@ -368,7 +368,7 @@ def main():
         norm=norm,
     )
     ax_a.set_xlabel(r"$\lambda$", fontsize=18)
-    ax_a.set_ylabel(r"$\gamma_\mathrm{r}$", fontsize=18)
+    ax_a.set_ylabel(r"$\gamma_\mathrm{real}$", fontsize=18)
     ax_a.tick_params(labelsize=14)
     ax_a.set_title(
         r"Stuart--Landau analytical regimes in $(\lambda,\gamma_\mathrm{r})$",

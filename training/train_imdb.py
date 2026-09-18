@@ -19,11 +19,12 @@ import hashlib
 import json
 import sys
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(PROJECT_ROOT)
+sys.path.insert(0, PROJECT_ROOT)
 DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
 TASK = 'imdb'
 
 from utils.model_factory import build_oscillator, manifold_dynamics_type
+from utils.device import resolve_device, seed_all
 
 from utils.run_dirs import make_run_dir, sweep_summary_path, epoch_dir, save_training_checkpoint
 from utils.slon_analysis import extract_model_parameters, compute_parameter_statistics
@@ -93,6 +94,8 @@ parser.add_argument('--output-dir', type=str, default=None,
                     help='Explicit output directory for this run (overrides timestamped default)')
 parser.add_argument('--sentiment-analysis-examples', type=int, default=100,
                     help='number of positive/negative test reviews for sentiment encoding analysis')
+parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cpu', 'cuda'],
+                    help='compute device (default: auto)')
 
 def tokenize(text):
     text = text.lower()
@@ -284,6 +287,20 @@ def download_glove(glove_dir=None, dim=100):
     return filepath
 
 def load_glove_vectors(glove_path, vocab, embed_dim):
+    cache_dir = os.path.join(os.path.dirname(glove_path), ".cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    vocab_key = hashlib.md5(
+        json.dumps(sorted(vocab.word2idx.items()), sort_keys=True).encode()
+    ).hexdigest()[:16]
+    mtime_ns = os.stat(glove_path).st_mtime_ns
+    cache_path = os.path.join(
+        cache_dir,
+        f"{os.path.basename(glove_path)}_{embed_dim}_{vocab_key}_{mtime_ns}.pt",
+    )
+    if os.path.isfile(cache_path):
+        print(f"Loading GloVe embedding matrix from cache ({cache_path})...")
+        return torch.load(cache_path, weights_only=True)
+
     print(f"Loading GloVe vectors from {glove_path}...")
     glove_dict = {}
     
@@ -311,7 +328,9 @@ def load_glove_vectors(glove_path, vocab, embed_dim):
             embedding_matrix[idx] = np.mean(list(glove_dict.values()), axis=0) if glove_dict else np.zeros(embed_dim, dtype=np.float32)
     
     print(f"Initialized {found}/{vocab_size - 2} vocabulary words with GloVe vectors")
-    return torch.from_numpy(embedding_matrix)
+    embedding_weights = torch.from_numpy(embedding_matrix)
+    torch.save(embedding_weights, cache_path)
+    return embedding_weights
 
 # wrapper model that includes embedding layer
 class SLONWithEmbedding(nn.Module):
@@ -370,8 +389,9 @@ if __name__ == '__main__':
 
     print(f"Using {args.dynamics} dynamics")
 
-    # fix seed
-    torch.manual_seed(args.seed)
+    device = resolve_device(args.device)
+    seed_all(args.seed, device)
+    print(f"Using device: {device}")
 
     # embedding dimension as input to SLON
     dim_input = args.embed_dim
@@ -494,9 +514,9 @@ if __name__ == '__main__':
         return texts, labels
 
     # data loaders
-    train_loader = DataLoader(train_data, batch_size=batch_size_train, shuffle=True, collate_fn=collate_batch)
-    valid_loader = DataLoader(valid_data, batch_size=batch_size_test, shuffle=False, collate_fn=collate_batch)
-    test_loader = DataLoader(test_data, batch_size=batch_size_test, shuffle=False, collate_fn=collate_batch)
+    train_loader = DataLoader(train_data, batch_size=batch_size_train, shuffle=True, collate_fn=collate_batch, pin_memory=device.type == "cuda")
+    valid_loader = DataLoader(valid_data, batch_size=batch_size_test, shuffle=False, collate_fn=collate_batch, pin_memory=device.type == "cuda")
+    test_loader = DataLoader(test_data, batch_size=batch_size_test, shuffle=False, collate_fn=collate_batch, pin_memory=device.type == "cuda")
 
     def train_with_params(omega_value, lambda_value=None, gamma_real_value=None, gamma_imag_value=None, sweep_idx=None, sweep_type=None):
         lambda_param = lambda_value if lambda_value is not None else args.lambda_param
@@ -508,6 +528,7 @@ if __name__ == '__main__':
                                   dropout=args.dropout, embedding_weights=embedding_weights,
                                   lambda_param=lambda_param, gamma_real=gamma_real_param, gamma_imag=gamma_imag_param,
                                   dynamics=args.dynamics, use_tanh=not args.no_tanh)
+        model = model.to(device)
 
         loss = torch.nn.CrossEntropyLoss()
 
@@ -521,7 +542,7 @@ if __name__ == '__main__':
         )
 
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        if args.output_dir is not None:
+        if args.output_dir:
             output_dir = args.output_dir
             os.makedirs(output_dir, exist_ok=True)
         elif sweep_idx is not None:
@@ -581,6 +602,8 @@ if __name__ == '__main__':
         with torch.no_grad():
             # loop over batches in data loader
             for i, (token_ids, labels) in enumerate(data_loader):
+                token_ids = token_ids.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
                 if args.shuffle:
                     # shuffle sequence order
                     perm = torch.randperm(token_ids.size(1))
@@ -687,6 +710,8 @@ if __name__ == '__main__':
 
             for batch_idx, (token_ids, labels) in tqdm(enumerate(train_loader), total = len(train_loader)):
                 model.train()
+                token_ids = token_ids.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
 
                 if args.shuffle:
                     perm = torch.randperm(token_ids.size(1))
@@ -715,13 +740,70 @@ if __name__ == '__main__':
 
                 optimizer.step()
 
-                if batch_idx % 100 == 0:
+                if not args.sweep_mode and batch_idx % 100 == 0:
                     test_acc = evaluate_model(test_loader, model, loss_fn, output_dir, epoch, batch_idx)
                     tqdm.write(f'epoch {epoch} batch {batch_idx}: test acc {test_acc:.2f}, loss: {train_loss.item():.4f}')
 
-            valid_acc = evaluate_model(valid_loader, model, loss_fn, output_dir)
-            test_acc, test_preds, test_labels = evaluate_model(test_loader, model, loss_fn, output_dir, epoch, len(train_loader) - 1, return_predictions=True)
-            
+            avg_train_loss = epoch_train_loss / len(train_loader)
+
+            if args.sweep_mode:
+                train_acc = float("nan")
+                valid_acc = evaluate_model(valid_loader, model, loss_fn, output_dir)
+                test_acc = evaluate_model(
+                    test_loader,
+                    model,
+                    loss_fn,
+                    output_dir,
+                    epoch,
+                    len(train_loader) - 1,
+                )
+                test_preds = test_labels = None
+                val_loss_avg = float("nan")
+                test_loss_avg = float("nan")
+            else:
+                valid_acc = evaluate_model(valid_loader, model, loss_fn, output_dir)
+                test_acc, test_preds, test_labels = evaluate_model(
+                    test_loader,
+                    model,
+                    loss_fn,
+                    output_dir,
+                    epoch,
+                    len(train_loader) - 1,
+                    return_predictions=True,
+                )
+                train_acc = evaluate_model(train_loader, model, loss_fn, output_dir)
+
+                model.eval()
+                val_loss_sum = 0.0
+                val_total = 0
+                test_loss_sum = 0.0
+                test_total = 0
+                with torch.no_grad():
+                    for token_ids, labels in valid_loader:
+                        token_ids = token_ids.to(device, non_blocking=True)
+                        labels = labels.to(device, non_blocking=True)
+                        if args.shuffle:
+                            perm = torch.randperm(token_ids.size(1))
+                            token_ids = token_ids[:, perm]
+                        output = model(token_ids)
+                        prediction = output['output']
+                        batch_loss = loss_fn(prediction, labels)
+                        val_loss_sum += batch_loss.item() * len(labels)
+                        val_total += len(labels)
+                    for token_ids, labels in test_loader:
+                        token_ids = token_ids.to(device, non_blocking=True)
+                        labels = labels.to(device, non_blocking=True)
+                        if args.shuffle:
+                            perm = torch.randperm(token_ids.size(1))
+                            token_ids = token_ids[:, perm]
+                        output = model(token_ids)
+                        prediction = output['output']
+                        batch_loss = loss_fn(prediction, labels)
+                        test_loss_sum += batch_loss.item() * len(labels)
+                        test_total += len(labels)
+                val_loss_avg = val_loss_sum / max(val_total, 1)
+                test_loss_avg = test_loss_sum / max(test_total, 1)
+
             is_best = valid_acc > best_eval
             if is_best:
                 best_eval = valid_acc
@@ -730,39 +812,6 @@ if __name__ == '__main__':
                 patience_counter = 0
             else:
                 patience_counter += 1
-
-            avg_train_loss = epoch_train_loss / len(train_loader)
-
-            # compute training accuracy
-            train_acc = evaluate_model(train_loader, model, loss_fn, output_dir)
-
-            # compute per-epoch validation and test losses
-            model.eval()
-            val_loss_sum = 0.0
-            val_total = 0
-            test_loss_sum = 0.0
-            test_total = 0
-            with torch.no_grad():
-                for token_ids, labels in valid_loader:
-                    if args.shuffle:
-                        perm = torch.randperm(token_ids.size(1))
-                        token_ids = token_ids[:, perm]
-                    output = model(token_ids)
-                    prediction = output['output']
-                    batch_loss = loss_fn(prediction, labels)
-                    val_loss_sum += batch_loss.item() * len(labels)
-                    val_total += len(labels)
-                for token_ids, labels in test_loader:
-                    if args.shuffle:
-                        perm = torch.randperm(token_ids.size(1))
-                        token_ids = token_ids[:, perm]
-                    output = model(token_ids)
-                    prediction = output['output']
-                    batch_loss = loss_fn(prediction, labels)
-                    test_loss_sum += batch_loss.item() * len(labels)
-                    test_total += len(labels)
-            val_loss_avg = val_loss_sum / max(val_total, 1)
-            test_loss_avg = test_loss_sum / max(test_total, 1)
 
             train_accs.append(train_acc)
             val_accs.append(valid_acc)

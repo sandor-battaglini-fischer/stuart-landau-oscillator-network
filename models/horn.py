@@ -53,21 +53,27 @@ class HORN(torch.nn.Module):
     def forward(self, batch, random_init=None, record=False):
         batch_size = batch.size(1)
         num_timesteps = batch.size(0)
+        device = batch.device
+        dtype = batch.dtype
 
         ret = {}
 
         if record:
-            rec_x_t = torch.zeros(batch_size, num_timesteps, self.num_nodes)
-            rec_y_t = torch.zeros(batch_size, num_timesteps, self.num_nodes)
+            rec_x_t = torch.zeros(
+                batch_size, num_timesteps, self.num_nodes, device=device, dtype=dtype
+            )
+            rec_y_t = torch.zeros(
+                batch_size, num_timesteps, self.num_nodes, device=device, dtype=dtype
+            )
             ret["rec_x_t"] = rec_x_t
             ret["rec_y_t"] = rec_y_t
 
         if random_init is not None:
-            x_t = torch.randn(batch_size, self.num_nodes) * random_init
-            y_t = torch.randn(batch_size, self.num_nodes) * random_init
+            x_t = torch.randn(batch_size, self.num_nodes, device=device, dtype=dtype) * random_init
+            y_t = torch.randn(batch_size, self.num_nodes, device=device, dtype=dtype) * random_init
         else:
-            x_t = torch.zeros(batch_size, self.num_nodes)
-            y_t = torch.zeros(batch_size, self.num_nodes)
+            x_t = torch.zeros(batch_size, self.num_nodes, device=device, dtype=dtype)
+            y_t = torch.zeros(batch_size, self.num_nodes, device=device, dtype=dtype)
 
         for t in range(num_timesteps):
             x_t, y_t = self.dynamics_step(x_t, y_t, batch[t])

@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import csv
 import json
+import math
+import os
 import re
 import subprocess
 import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import Normalize
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -96,6 +100,7 @@ def record_from_sweep_run_dir(
     variant_key: str,
     seed: int | None = None,
     source_dir: Path | None = None,
+    mg_final_epoch: bool = False,
 ) -> dict | None:
     run_log_path = run_dir / "log.txt"
     metrics_path = run_dir / "metrics.json"
@@ -139,7 +144,7 @@ def record_from_sweep_run_dir(
     }
 
     if task_key == "mackey_glass":
-        mg_metrics = parse_mackey_glass_best_metrics(metrics_path)
+        mg_metrics = parse_mackey_glass_metrics(metrics_path, final_epoch=mg_final_epoch)
         if mg_metrics is None:
             return None
         record.update(mg_metrics)
@@ -163,6 +168,9 @@ def record_from_sweep_run_dir(
         record["metric"] = metric
         record["test_acc"] = metric
 
+    if params.get("horizon") not in (None, ""):
+        record["horizon"] = int(float(params["horizon"]))
+
     record["status"] = "ok"
     return record
 
@@ -184,27 +192,41 @@ def parse_classification_metric(text: str) -> float | None:
     return float(matches[-1])
 
 
+def _mackey_glass_metrics_row(epochs: list[dict], *, final_epoch: bool) -> dict:
+    if final_epoch:
+        return max(epochs, key=lambda row: row["epoch"])
+    return min(
+        epochs,
+        key=lambda row: row["val_normalized_error"]
+        if row.get("val_normalized_error") is not None
+        else float("inf"),
+    )
+
+
 def parse_mackey_glass_best_metrics(metrics_path: Path) -> dict[str, float] | None:
+    return parse_mackey_glass_metrics(metrics_path, final_epoch=False)
+
+
+def parse_mackey_glass_metrics(
+    metrics_path: Path,
+    *,
+    final_epoch: bool = False,
+) -> dict[str, float] | None:
     if not metrics_path.is_file():
         return None
     with metrics_path.open() as f:
         epochs = json.load(f)
     if not epochs:
         return None
-    best_epoch = min(
-        epochs,
-        key=lambda row: row["val_normalized_error"]
-        if row.get("val_normalized_error") is not None
-        else float("inf"),
-    )
+    selected = _mackey_glass_metrics_row(epochs, final_epoch=final_epoch)
     return {
-        "test_r2": float(best_epoch["test_r2"]),
-        "val_r2": float(best_epoch["val_r2"]),
-        "test_normalized_error": float(best_epoch["test_normalized_error"]),
-        "val_normalized_error": float(best_epoch["val_normalized_error"]),
-        "test_mse": float(best_epoch["test_mse"]),
-        "val_mse": float(best_epoch["val_mse"]),
-        "best_epoch": int(best_epoch["epoch"]),
+        "test_r2": float(selected["test_r2"]),
+        "val_r2": float(selected["val_r2"]),
+        "test_normalized_error": float(selected["test_normalized_error"]),
+        "val_normalized_error": float(selected["val_normalized_error"]),
+        "test_mse": float(selected["test_mse"]),
+        "val_mse": float(selected["val_mse"]),
+        "best_epoch": int(selected["epoch"]),
     }
 
 
@@ -385,6 +407,7 @@ def run_training_cmd(
     metric_key: str,
     dry_run: bool,
     output_dir: Path | None = None,
+    use_gpu: bool = False,
 ) -> dict:
     record: dict = {
         "status": "pending",
@@ -399,14 +422,58 @@ def run_training_cmd(
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
     start = time.time()
-    print(" ".join(cmd))
+    print(" ".join(cmd), flush=True)
 
-    proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
-    stdout = proc.stdout or ""
-    stderr = proc.stderr or ""
-    log_path.write_text(stdout + ("\n" + stderr if stderr else ""))
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env["TQDM_DISABLE"] = "1"
+    if use_gpu:
+        env.setdefault("OMP_NUM_THREADS", "4")
+        env.setdefault("MKL_NUM_THREADS", "4")
+        env.setdefault("OPENBLAS_NUM_THREADS", "4")
+        env.setdefault("NUMEXPR_NUM_THREADS", "4")
+        env.setdefault("TORCH_NUM_THREADS", "4")
+    else:
+        env["CUDA_VISIBLE_DEVICES"] = ""
+        env["NVIDIA_VISIBLE_DEVICES"] = ""
+        env.setdefault("OMP_NUM_THREADS", "1")
+        env.setdefault("MKL_NUM_THREADS", "1")
+        env.setdefault("OPENBLAS_NUM_THREADS", "1")
+        env.setdefault("NUMEXPR_NUM_THREADS", "1")
+        env.setdefault("TORCH_NUM_THREADS", "1")
+        ld = env.get("LD_LIBRARY_PATH", "")
+        if ld:
+            cleaned = [
+                p
+                for p in ld.split(":")
+                if p and "cuda" not in p.lower() and "nvidia" not in p.lower()
+            ]
+            env["LD_LIBRARY_PATH"] = ":".join(cleaned)
 
-    record["returncode"] = proc.returncode
+    stdout_chunks: list[str] = []
+    with log_path.open("w") as log_f:
+        log_f.write("CMD: " + " ".join(cmd) + "\n")
+        log_f.flush()
+        proc = subprocess.Popen(
+            cmd,
+            cwd=REPO_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            stdout_chunks.append(line)
+            log_f.write(line)
+            log_f.flush()
+        returncode = proc.wait()
+
+    stdout = "".join(stdout_chunks)
+    stderr = ""
+
+    record["returncode"] = returncode
     if output_dir is None:
         output_dir = find_newest_output_dir(output_glob, start)
     if output_dir is not None:
@@ -415,9 +482,9 @@ def run_training_cmd(
         except ValueError:
             record["output_dir"] = str(output_dir)
 
-    if proc.returncode != 0:
+    if returncode != 0:
         record["status"] = "failed"
-        record["error"] = stderr[-2000:] if stderr else stdout[-2000:]
+        record["error"] = (stderr or stdout)[-2000:]
         return record
 
     if task_key == "mackey_glass":
@@ -557,3 +624,124 @@ def add_stats_legend(fig, y: float = 1.08) -> None:
         plt.Rectangle((0, 0), 1, 1, facecolor="gray", alpha=0.25, label="$95\\%$ CI"),
     ]
     fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, y), ncol=2, frameon=False)
+
+
+def load_sweep_config(sweep_dir: Path) -> dict:
+    path = sweep_dir / "sweep_config.json"
+    if not path.is_file():
+        return {}
+    with path.open() as f:
+        return json.load(f)
+
+
+def observed_horizons(
+    results: dict,
+    tasks: list[str],
+    horizon_key: str = "horizon",
+) -> list[int]:
+    found: set[int] = set()
+    for task_key in tasks:
+        for entry in results.get(task_key, []):
+            h = entry.get(horizon_key)
+            if h is not None:
+                found.add(int(h))
+    return sorted(found)
+
+
+def union_horizons(*groups: list[int] | None) -> list[int] | None:
+    merged: set[int] = set()
+    for group in groups:
+        if group:
+            merged.update(int(h) for h in group)
+    return sorted(merged) if merged else None
+
+
+def select_plot_horizons(present: list[int], requested: list[int] | None) -> list[int]:
+    if requested is None:
+        return list(present)
+    wanted = {int(h) for h in requested}
+    return [h for h in present if h in wanted]
+
+
+def resolve_plot_horizons(
+    cli_horizons: list[int] | None,
+    cfg: dict,
+    results: dict,
+    tasks: list[str],
+    horizon_key: str = "horizon",
+) -> list[int] | None:
+    if cli_horizons is not None:
+        return cli_horizons
+    observed = observed_horizons(results, tasks, horizon_key)
+    configured = [int(h) for h in cfg["horizons"]] if cfg.get("horizons") else []
+    if configured:
+        return union_horizons(configured, observed)
+    if not observed:
+        return None
+    return list(range(min(observed), max(observed) + 1))
+
+
+def print_finished_remaining(categories: list[tuple[str, int, int]]) -> None:
+    tot_done = 0
+    tot_rem = 0
+    for name, done, total in categories:
+        rem = max(int(total) - int(done), 0)
+        print(f"{name}  {done}  {rem}")
+        tot_done += int(done)
+        tot_rem += rem
+    if len(categories) > 1:
+        print(f"total  {tot_done}  {tot_rem}")
+
+
+def load_configured_horizons(sweep_dir: Path) -> list[int] | None:
+    cfg = sweep_dir / "sweep_config.json"
+    if not cfg.is_file():
+        return None
+    with cfg.open() as f:
+        raw = json.load(f).get("horizons")
+    if not raw:
+        return None
+    return [int(h) for h in raw]
+
+
+def horizon_color_scale(present: list[int], sweep_dir: Path | None = None):
+    configured = load_configured_horizons(sweep_dir) if sweep_dir is not None else None
+    scale = union_horizons(configured, present) or [1]
+    vmin = float(scale[0])
+    vmax = float(scale[-1])
+    if vmax <= vmin:
+        vmax = vmin + 1.0
+    return plt.cm.viridis, Normalize(vmin=vmin, vmax=vmax)
+
+
+def horizon_colorbar_ticks(norm: Normalize) -> list[int]:
+    vmin = float(norm.vmin)
+    vmax = float(norm.vmax)
+    span = vmax - vmin
+    if span <= 10:
+        step = 1
+    elif span <= 25:
+        step = 5
+    else:
+        step = 10
+    start = int(math.ceil(vmin / step) * step)
+    ticks = list(range(start, int(vmax) + 1, step))
+    lo = int(round(vmin))
+    hi = int(round(vmax))
+    if not ticks or ticks[0] != lo:
+        ticks = [lo] + [t for t in ticks if t > lo]
+    if ticks[-1] != hi:
+        ticks.append(hi)
+    return sorted(dict.fromkeys(ticks))
+
+
+def add_horizon_colorbar(fig, ax, cmap, norm, label: str = "Horizon"):
+    sm = ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, pad=0.02)
+    cbar.set_ticks(horizon_colorbar_ticks(norm))
+    label_size = ax.yaxis.label.get_size()
+    tick_size = plt.rcParams.get("ytick.labelsize", label_size)
+    cbar.set_label(label, size=label_size)
+    cbar.ax.tick_params(labelsize=tick_size)
+    return cbar

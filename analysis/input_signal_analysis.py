@@ -11,7 +11,7 @@ if PROJECT_ROOT not in sys.path:
 
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
-from matplotlib.cm import ScalarMappable
+from matplotlib.lines import Line2D
 import numpy as np
 import torch
 import torchvision
@@ -48,6 +48,19 @@ TASK_COLORS = {
     "imdb": "black",
     "mackey_glass": "black",
 }
+
+HORIZON_COLORS = {
+    1: thesis_blue,
+    25: thesis_red,
+}
+
+
+def horizon_color(h):
+    h = int(h)
+    if h in HORIZON_COLORS:
+        return HORIZON_COLORS[h]
+    palette = [thesis_blue, thesis_red, ifisc_green]
+    return palette[h % len(palette)]
 
 
 def resolve_output_dir(prefix, output_dir=None):
@@ -434,37 +447,202 @@ def plot_mackey_glass_with_discretization(
     input_scale=1.0,
     sample_step=1,
     color=thesis_blue,
+    view_length=None,
+    marker_size=12,
+    show_target=False,
+    extend_to=None,
+    horizons=None,
 ):
-    scaled_series = series * input_scale
-    window_indices = np.unique(series_indices.astype(np.int64))
-    window_start = int(window_indices[0])
-    window_end = int(window_indices[-1])
-    view_indices = np.arange(window_start, window_end + 1)
+    scaled_series = np.asarray(series) * input_scale
+    series_indices = np.asarray(series_indices, dtype=np.int64)
+    mg_trace = np.asarray(mg_trace)
+    last_idx = int(series_indices[-1])
+    if horizons is None:
+        horizons = [int(horizon)] if show_target else []
+    else:
+        horizons = [int(h) for h in horizons]
+    extra = int(extend_to) if extend_to is not None else (max(horizons) if horizons else 0)
+    window_end = min(len(scaled_series) - 1, last_idx + extra)
+    if view_length is not None:
+        window_start = max(0, last_idx - int(view_length) + 1)
+    else:
+        window_start = int(np.unique(series_indices)[0])
 
+    past_idx = np.arange(window_start, last_idx + 1)
     ax.plot(
-        view_indices,
-        scaled_series[view_indices],
-        color=color,
-        alpha=0.25,
-        linewidth=0.5,
-    )
-    ax.scatter(
-        view_indices,
-        scaled_series[view_indices],
-        color=color,
-        s=12,
-        alpha=0.5,
-        label="samples",
-        zorder=3,
-    )
-    ax.plot(
-        series_indices,
-        mg_trace,
-        label="Input",
+        past_idx,
+        scaled_series[past_idx],
         color=color,
         linewidth=1.5,
+        zorder=3,
+        label="time series",
+    )
+    ax.scatter(
+        past_idx,
+        scaled_series[past_idx],
+        color=color,
+        s=marker_size,
+        alpha=0.85,
         zorder=4,
     )
+    visible = (series_indices >= window_start) & (series_indices <= last_idx)
+    if np.any(visible):
+        ax.plot(
+            series_indices[visible],
+            mg_trace[visible],
+            color=color,
+            linewidth=1.5,
+            zorder=5,
+        )
+    if extra > 0:
+        future_idx = np.arange(last_idx, window_end + 1)
+        ax.plot(
+            future_idx,
+            scaled_series[future_idx],
+            color="0.55",
+            linewidth=1.5,
+            zorder=3,
+        )
+        if len(future_idx) > 1:
+            ax.scatter(
+                future_idx[1:],
+                scaled_series[future_idx[1:]],
+                color="0.55",
+                s=marker_size,
+                alpha=0.9,
+                zorder=4,
+            )
+        ax.axvline(last_idx, color="0.35", linewidth=1.4, zorder=6)
+        for h in sorted(horizons, reverse=True):
+            target_idx = last_idx + h
+            if target_idx >= len(scaled_series):
+                continue
+            h_color = horizon_color(h)
+            seg = np.arange(last_idx, target_idx + 1)
+            ax.plot(
+                seg,
+                scaled_series[seg],
+                color=h_color,
+                linewidth=2.4,
+                zorder=7,
+                label=rf"$H={h}$",
+            )
+            ax.scatter(
+                seg[1:],
+                scaled_series[seg[1:]],
+                color=h_color,
+                s=marker_size,
+                zorder=8,
+            )
+        ax.set_xlim(window_start - 0.5, window_end + 0.5)
+    return window_start, window_end
+
+
+def plot_mackey_glass_delay(
+    ax,
+    series,
+    horizons,
+    input_scale=1.0,
+):
+    scaled = np.asarray(series) * input_scale
+    horizons = [int(h) for h in horizons if 1 <= int(h) < len(scaled)]
+    if not horizons:
+        return
+    pad = 0.05 * (scaled.max() - scaled.min() if scaled.max() > scaled.min() else 1.0)
+    for h in sorted(horizons, reverse=True):
+        h_color = horizon_color(h)
+        ax.plot(
+            scaled[:-h],
+            scaled[h:],
+            color=h_color,
+            lw=0.1,
+            zorder=1,
+        )
+    ax.set_xlabel(r"$x(t-H)$")
+    ax.set_ylabel(r"$x(t)$")
+    ax.set_xlim(scaled.min() - pad, scaled.max() + pad)
+    ax.set_ylim(scaled.min() - pad, scaled.max() + pad)
+    ax.set_title("Delay plot", loc="left")
+    handles = [
+        Line2D([0], [0], color=horizon_color(h), lw=3.0, label=rf"$H={h}$")
+        for h in horizons
+    ]
+    ax.legend(handles=handles, loc="best", fontsize=12, handlelength=2.4)
+
+
+def plot_mg_timeseries_and_delay(
+    series,
+    mg_trace,
+    series_indices,
+    input_length,
+    horizons,
+    input_scale,
+    output_path,
+    color=None,
+    view_length=80,
+    zoom_length=22,
+):
+    if color is None:
+        color = TASK_COLORS["mackey_glass"]
+    horizons = [int(h) for h in horizons]
+    max_h = max(horizons)
+    fig, axes = plt.subplots(
+        1, 3, figsize=(10.0, 3.55), gridspec_kw={"width_ratios": [1.0, 1.35, 1.05]}
+    )
+    ax_ts, ax_zoom, ax_delay = axes
+
+    plot_mackey_glass_with_discretization(
+        ax_ts,
+        series,
+        mg_trace,
+        series_indices,
+        input_length,
+        horizons[0],
+        input_scale=input_scale,
+        color=color,
+        view_length=view_length,
+        marker_size=9,
+        show_target=True,
+        extend_to=2 * max_h,
+        horizons=horizons,
+    )
+    ax_ts.set_title("Mackey–Glass", loc="left")
+    ax_ts.set_ylabel("Input value")
+    ax_ts.set_xlabel("Time step")
+    ax_ts.legend(loc="best", fontsize=12)
+
+    zoom_start, zoom_end = plot_mackey_glass_with_discretization(
+        ax_zoom,
+        series,
+        mg_trace,
+        series_indices,
+        input_length,
+        horizons[0],
+        input_scale=input_scale,
+        color=color,
+        view_length=zoom_length,
+        marker_size=30,
+        show_target=True,
+        extend_to=2 * max_h,
+        horizons=horizons,
+    )
+    ax_zoom.set_xlabel("Time step")
+    ax_zoom.set_title(r"Zoom ($\Delta t=1$)", loc="left")
+    ax_zoom.set_xticks(
+        np.unique(np.linspace(zoom_start, zoom_end, 3).astype(int))
+    )
+
+    plot_mackey_glass_delay(
+        ax_delay,
+        series,
+        horizons,
+        input_scale=input_scale,
+    )
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved plot: {output_path}")
 
 
 def get_mg_pre_acts(args, model=None, series=None, return_model=False):
@@ -553,22 +731,17 @@ def analyze_mg(args):
     output_dir = resolve_output_dir("mg", getattr(args, "output_dir", None))
     plot_single_example_time_series(pre_acts, output_dir, prefix="mg", num_units=args.num_units_plot, example_idx=0)
 
-    plt.figure(figsize=(10, 4))
-    ax = plt.gca()
-    plot_mackey_glass_with_discretization(
-        ax,
+    plot_mg_timeseries_and_delay(
         series,
         mg_trace,
         series_indices,
         args.mg_input_length,
-        args.mg_horizon,
-        input_scale=args.mg_input_scale,
+        [1, 25],
+        args.mg_input_scale,
+        os.path.join(output_dir, "mg_timeseries_delay.png"),
+        view_length=getattr(args, "mg_view_length", 80),
+        zoom_length=getattr(args, "mg_zoom_length", 22),
     )
-    plt.xlabel("time step")
-    plt.ylabel("MG value")
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "mg_single_example_raw_input.png"), transparent=True)
-    plt.close()
 
     if args.checkpoint is not None and os.path.isfile(args.checkpoint):
         _, _, test_loader, _, _, _ = build_dataloaders(
@@ -648,6 +821,14 @@ def analyze_compare(args):
         mg_input_scales = [1.0]
     else:
         mg_input_scales = args.mg_input_scale if isinstance(args.mg_input_scale, list) else [args.mg_input_scale]
+
+    if getattr(args, "mg_horizon", None) is None:
+        mg_horizons = [1, 25]
+    else:
+        mg_horizons = args.mg_horizon if isinstance(args.mg_horizon, list) else [args.mg_horizon]
+    mg_horizons = [int(h) for h in mg_horizons]
+    mg_view_length = getattr(args, "mg_view_length", 100)
+    mg_zoom_length = getattr(args, "mg_zoom_length", 22)
 
     num_mg_settings = len(mg_lambdas)
     if not (
@@ -740,7 +921,7 @@ def analyze_compare(args):
                 gamma_imag=g_im,
                 mg_series_length=args.mg_series_length,
                 mg_input_length=args.mg_input_length,
-                mg_horizon=args.mg_horizon,
+                mg_horizon=mg_horizons[0],
                 mg_tau=args.mg_tau,
                 mg_delta_t=args.mg_delta_t,
                 mg_beta=args.mg_beta,
@@ -760,109 +941,102 @@ def analyze_compare(args):
             models_mg.append(model_mg)
             series_mg_list.append(series_mg)
 
-    sm_series = pre_acts_smnist[:, 0, 0].numpy() if use_sm else None
-    im_series = pre_acts_imdb[:, 0, 0].numpy() if use_im else None
-    mg_series_list = [pre_acts_mg[:, 0, 0].numpy() for pre_acts_mg in mg_pre_acts_list] if use_mg else []
-
     output_dir = resolve_output_dir("compare", getattr(args, "output_dir", None))
-
-    base_sm = None
-    if use_sm:
-        base_sm = simulate_stuart_landau_base(
-            lambda_param=sm_lambda,
-            omega=sm_omega,
-            gamma_real=sm_gamma_real,
-            gamma_imag=sm_gamma_imag,
-            h=args.h,
-            num_steps=sm_series.shape[0],
-        )
-
-    base_im = None
-    if use_im:
-        base_im = simulate_stuart_landau_base(
-            lambda_param=im_lambda,
-            omega=omega_imdb,
-            gamma_real=im_gamma_real,
-            gamma_imag=im_gamma_imag,
-            h=args.h,
-            num_steps=im_series.shape[0],
-        )
-
-    base_mg_list = []
-    if use_mg:
-        for lam, omg, g_re, g_im, mg_series in zip(
-            mg_lambdas, mg_omegas, mg_gamma_reals, mg_gamma_imags, mg_series_list
-        ):
-            base_mg = simulate_stuart_landau_base(
-                lambda_param=lam,
-                omega=omg,
-                gamma_real=g_re,
-                gamma_imag=g_im,
-                h=args.h,
-                num_steps=mg_series.shape[0],
-            )
-            base_mg_list.append(base_mg)
 
     t_sm_raw = np.arange(pixel_trace.shape[0]) if use_sm else None
     t_im_raw = np.arange(embed_mag_trace.shape[0]) if use_im else None
 
-    panels = []
+    n_rows = int(use_im) + int(use_sm) + int(use_mg)
+    fig = plt.figure(figsize=(7.2, 3.05 * max(n_rows, 1)), layout="constrained")
+    gs = fig.add_gridspec(n_rows, 2)
+    row = 0
+    last_time_ax = None
+
     if use_im:
-        panels.append("im")
-    if use_sm:
-        panels.append("sm")
-    if use_mg:
-        panels.append("mg")
-
-    n_tasks = len(panels)
-    fig, axes = plt.subplots(n_tasks, 1, figsize=(7, 3.2 * n_tasks))
-    if n_tasks == 1:
-        axes = [axes]
-
-    for ax, panel in zip(axes, panels):
-        if panel == "sm":
-            color = TASK_COLORS["smnist"]
-            ax.plot(t_sm_raw, pixel_trace, color=color, linewidth=1.5, label="Input")
-            for x in range(28, int(t_sm_raw[-1]) + 1, 28):
-                ax.axvline(x=x, color=color, alpha=0.2, linewidth=0.8)
-            ax.set_ylim(_ylim_with_margin(pixel_trace, base_sm))
-            ax.set_title("sMNIST", loc="left")
-        elif panel == "im":
-            color = TASK_COLORS["imdb"]
-            ax.plot(t_im_raw, embed_mag_trace, color=color, linewidth=1.5, label="Input")
-            ax.set_ylim(_ylim_with_margin(embed_mag_trace, base_im))
-            ax.set_title("IMDB", loc="left")
-        elif panel == "mg":
-            color = TASK_COLORS["mackey_glass"]
-            mg_trace = mg_trace_list[0]
-            series_mg = series_mg_list[0]
-            series_indices = mg_series_indices_list[0]
-            base_mg = base_mg_list[0]
-            inp_scale = mg_input_scales[0]
-            plot_mackey_glass_with_discretization(
-                ax,
-                series_mg,
-                mg_trace,
-                series_indices,
-                args.mg_input_length,
-                args.mg_horizon,
-                input_scale=inp_scale,
-                color=color,
-            )
-            ax.set_ylim(_ylim_with_margin(mg_trace, base_mg))
-            ax.set_title("Mackey-Glass", loc="left")
+        ax = fig.add_subplot(gs[row, :])
+        color = TASK_COLORS["imdb"]
+        ax.plot(t_im_raw, embed_mag_trace, color=color, linewidth=1.5, label="Input")
+        ax.set_ylim(_ylim_with_margin(embed_mag_trace))
+        ax.set_title("IMDB", loc="left")
         ax.set_ylabel("Input value")
         ax.legend(loc="lower right", fontsize=14)
+        last_time_ax = ax
+        row += 1
 
-    for ax in axes[:-1]:
-        ax.set_xlabel("")
-    axes[-1].set_xlabel("Time step")
-    fig.suptitle("Input signals", y=1.02)
-    fig.tight_layout()
+    if use_sm:
+        ax = fig.add_subplot(gs[row, :])
+        color = TASK_COLORS["smnist"]
+        ax.plot(t_sm_raw, pixel_trace, color=color, linewidth=1.5, label="Input")
+        for x in range(28, int(t_sm_raw[-1]) + 1, 28):
+            ax.axvline(x=x, color=color, alpha=0.2, linewidth=0.8)
+        ax.set_ylim(_ylim_with_margin(pixel_trace))
+        ax.set_title("sMNIST", loc="left")
+        ax.set_ylabel("Input value")
+        ax.legend(loc="lower right", fontsize=14)
+        last_time_ax = ax
+        row += 1
+
+    if use_mg:
+        ax_mg = fig.add_subplot(gs[row, 0])
+        ax_delay = fig.add_subplot(gs[row, 1])
+        color = TASK_COLORS["mackey_glass"]
+        mg_trace = mg_trace_list[0]
+        series_mg = series_mg_list[0]
+        series_indices = mg_series_indices_list[0]
+        inp_scale = mg_input_scales[0]
+        max_h = max(mg_horizons)
+        plot_mackey_glass_with_discretization(
+            ax_mg,
+            series_mg,
+            mg_trace,
+            series_indices,
+            args.mg_input_length,
+            mg_horizons[0],
+            input_scale=inp_scale,
+            color=color,
+            view_length=mg_view_length,
+            marker_size=16,
+            show_target=True,
+            extend_to=2 * max_h,
+            horizons=mg_horizons,
+        )
+        ax_mg.set_title("Mackey–Glass", loc="left")
+        last_idx = int(np.asarray(series_indices)[-1])
+        view_slice = np.asarray(series_mg)[
+            max(0, last_idx - mg_view_length + 1) : last_idx + 2 * max_h + 1
+        ] * inp_scale
+        ax_mg.set_ylim(_ylim_with_margin(view_slice))
+        ax_mg.set_ylabel("Input value")
+        ax_mg.set_xlabel("Time step")
+        ax_mg.legend(loc="lower left", fontsize=12)
+        plot_mackey_glass_delay(
+            ax_delay,
+            series_mg,
+            mg_horizons,
+            input_scale=inp_scale,
+        )
+        last_time_ax = ax_mg
+
+    if last_time_ax is not None and not use_mg:
+        last_time_ax.set_xlabel("Time step")
+    fig.suptitle("Input signals")
     plot_path = os.path.join(output_dir, "input_signals.png")
     fig.savefig(plot_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved plot: {plot_path}")
+
+    if use_mg:
+        plot_mg_timeseries_and_delay(
+            series_mg_list[0],
+            mg_trace_list[0],
+            mg_series_indices_list[0],
+            args.mg_input_length,
+            mg_horizons,
+            mg_input_scales[0],
+            os.path.join(output_dir, "mg_timeseries_delay.png"),
+            view_length=min(mg_view_length, 80),
+            zoom_length=mg_zoom_length,
+        )
 
 
 def main():
@@ -924,7 +1098,15 @@ def main():
     mg_parser.add_argument("--mg-series-length", type=int, default=20000)
     mg_parser.add_argument("--mg-input-length", type=int, default=50)
     mg_parser.add_argument("--mg-horizon", type=int, default=1)
+    mg_parser.add_argument("--mg-view-length", type=int, default=80)
+    mg_parser.add_argument("--mg-zoom-length", type=int, default=22)
     mg_parser.add_argument("--mg-tau", type=float, default=17.0)
+    mg_parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Output directory (default: results/input_analysis/mg_<timestamp>)",
+    )
     mg_parser.add_argument("--mg-delta-t", type=float, default=1.0)
     mg_parser.add_argument("--mg-beta", type=float, default=0.2)
     mg_parser.add_argument("--mg-gamma", type=float, default=0.1)
@@ -970,7 +1152,9 @@ def main():
     compare_parser.add_argument("--mg-input-scale", type=float, action="append", default=None)
     compare_parser.add_argument("--mg-series-length", type=int, default=20000)
     compare_parser.add_argument("--mg-input-length", type=int, default=800)
-    compare_parser.add_argument("--mg-horizon", type=int, default=1)
+    compare_parser.add_argument("--mg-horizon", type=int, action="append", default=None)
+    compare_parser.add_argument("--mg-view-length", type=int, default=100)
+    compare_parser.add_argument("--mg-zoom-length", type=int, default=22)
     compare_parser.add_argument("--mg-tau", type=float, default=17.0)
     compare_parser.add_argument("--mg-delta-t", type=float, default=1.0)
     compare_parser.add_argument("--mg-beta", type=float, default=0.2)

@@ -32,24 +32,41 @@ class SLON(torch.nn.Module):
         self.linear_dynamics = linear_dynamics
 
         if lambda_param is None:
-            self.lambda_param = torch.ones(num_nodes) * (-abs(gamma))
+            lambda_tensor = torch.ones(num_nodes) * (-abs(gamma))
         else:
-            self.lambda_param = lambda_param if isinstance(lambda_param, torch.Tensor) else torch.ones(num_nodes) * lambda_param
-        
+            lambda_tensor = (
+                lambda_param
+                if isinstance(lambda_param, torch.Tensor)
+                else torch.ones(num_nodes) * lambda_param
+            )
+
         if isinstance(omega, torch.Tensor):
-            self.omega_param = omega
+            omega_tensor = omega
         else:
-            self.omega_param = torch.ones(num_nodes) * omega
-        
+            omega_tensor = torch.ones(num_nodes) * omega
+
         if gamma_real is None:
-            self.gamma_real = torch.ones(num_nodes) * (-0.1)
+            gamma_real_tensor = torch.ones(num_nodes) * (-0.1)
         else:
-            self.gamma_real = gamma_real if isinstance(gamma_real, torch.Tensor) else torch.ones(num_nodes) * gamma_real
-        
+            gamma_real_tensor = (
+                gamma_real
+                if isinstance(gamma_real, torch.Tensor)
+                else torch.ones(num_nodes) * gamma_real
+            )
+
         if gamma_imag is None:
-            self.gamma_imag = torch.ones(num_nodes) * 0.0
+            gamma_imag_tensor = torch.ones(num_nodes) * 0.0
         else:
-            self.gamma_imag = gamma_imag if isinstance(gamma_imag, torch.Tensor) else torch.ones(num_nodes) * gamma_imag
+            gamma_imag_tensor = (
+                gamma_imag
+                if isinstance(gamma_imag, torch.Tensor)
+                else torch.ones(num_nodes) * gamma_imag
+            )
+
+        self.register_buffer("lambda_param", lambda_tensor)
+        self.register_buffer("omega_param", omega_tensor)
+        self.register_buffer("gamma_real", gamma_real_tensor)
+        self.register_buffer("gamma_imag", gamma_imag_tensor)
 
         self.gain_rec = 1. / math.sqrt(self.num_nodes)
 
@@ -87,24 +104,27 @@ class SLON(torch.nn.Module):
     def forward(self, batch, random_init = None, record = False):
         batch_size = batch.size(1)
         num_timesteps = batch.size(0)
+        device = batch.device
+        dtype = batch.dtype
 
         ret = {}
 
         if record:
-            rec_z_real = torch.zeros(batch_size, num_timesteps, self.num_nodes)
-            rec_z_imag = torch.zeros(batch_size, num_timesteps, self.num_nodes)
+            rec_z_real = torch.zeros(
+                batch_size, num_timesteps, self.num_nodes, device=device, dtype=dtype
+            )
+            rec_z_imag = torch.zeros(
+                batch_size, num_timesteps, self.num_nodes, device=device, dtype=dtype
+            )
             ret['rec_z_real'] = rec_z_real
             ret['rec_z_imag'] = rec_z_imag
 
         if not random_init is None:
-            z_real_0 = torch.randn(batch_size, self.num_nodes) * random_init
-            z_imag_0 = torch.randn(batch_size, self.num_nodes) * random_init
+            z_real = torch.randn(batch_size, self.num_nodes, device=device, dtype=dtype) * random_init
+            z_imag = torch.randn(batch_size, self.num_nodes, device=device, dtype=dtype) * random_init
         else:
-            z_real_0 = torch.zeros(batch_size, self.num_nodes)
-            z_imag_0 = torch.zeros(batch_size, self.num_nodes)
-
-        z_real = torch.autograd.Variable(z_real_0)
-        z_imag = torch.autograd.Variable(z_imag_0)
+            z_real = torch.zeros(batch_size, self.num_nodes, device=device, dtype=dtype)
+            z_imag = torch.zeros(batch_size, self.num_nodes, device=device, dtype=dtype)
 
         for t in range(num_timesteps):
             z_real, z_imag = self.dynamics_step(z_real, z_imag, batch[t])

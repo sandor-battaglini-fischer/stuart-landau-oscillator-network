@@ -65,7 +65,7 @@ TASKS: dict[str, TaskConfig] = {
         base_cmd=[
             sys.executable,
             "training/train_smnist.py",
-            "--lambda-param", "0.0",
+            "--lambda-param", "0.1",
             "--gamma-real", "-0.1",
             "--gamma-imag", "0.0",
             "--epochs", "10",

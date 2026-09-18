@@ -1,4 +1,16 @@
 import os
+import sys
+
+_cli_device = "cpu"
+if "--device" in sys.argv:
+    _idx = sys.argv.index("--device")
+    if _idx + 1 < len(sys.argv):
+        _cli_device = sys.argv[_idx + 1]
+_force_cpu = _cli_device != "cuda"
+if _force_cpu:
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    os.environ["NVIDIA_VISIBLE_DEVICES"] = ""
+
 import argparse
 import json
 from datetime import datetime
@@ -6,6 +18,16 @@ from glob import glob
 
 import numpy as np
 import torch
+torch.set_num_threads(int(os.environ.get("TORCH_NUM_THREADS", "1")))
+try:
+    torch.set_num_interop_threads(1)
+except RuntimeError:
+    pass
+if _force_cpu:
+    torch.cuda.is_available = lambda: False  # type: ignore[method-assign]
+    torch.cuda.device_count = lambda: 0  # type: ignore[method-assign]
+    if hasattr(torch.cuda, "_lazy_init"):
+        torch.cuda._lazy_init = lambda: None  # type: ignore[method-assign]
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 import pandas as pd
@@ -13,11 +35,12 @@ from scipy.signal import find_peaks
 
 import sys
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(PROJECT_ROOT)
+sys.path.insert(0, PROJECT_ROOT)
 TASK = 'mackey_glass'
 
+from utils.device import resolve_device, seed_all
+from utils.run_dirs import make_run_dir, sweep_summary_path, epoch_dir, save_training_checkpoint, promote_epoch_artifacts, atomic_write_json
 from utils.model_factory import build_oscillator, manifold_dynamics_type
-from utils.run_dirs import make_run_dir, sweep_summary_path, epoch_dir, save_training_checkpoint, promote_epoch_artifacts
 from utils.manifold_dimension_analysis import analyze_manifold_dimension, collect_and_save_final_states
 from utils.slon_analysis import extract_model_parameters, compute_parameter_statistics
 from utils.plotting_utils import (
@@ -27,9 +50,7 @@ from utils.plotting_utils import (
     plot_epoch_weight_heatmaps,
     create_mackey_glass_gifs,
     plot_signal_stages_for_example,
-    plot_mackey_glass_encoding_analysis_from_loader,
 )
-from utils.plotting_utils.mackey_glass_encoding import GROUP_LABELS
 
 
 class MackeyGlassDataset(Dataset):
@@ -181,8 +202,19 @@ def build_dataloaders(
     return train_loader, val_loader, test_loader, series, removed_freqs, removed_powers
 
 
+def _model_device(model):
+    return next(model.parameters()).device
+
+
+def _to_device(x, device):
+    if x is None or not isinstance(x, torch.Tensor):
+        return x
+    return x.to(device, non_blocking=device.type == "cuda")
+
+
 def evaluate_model(data_loader, model, loss_fn, batch_size_test, mse_loss_fn=None):
     model.eval()
+    device = _model_device(model)
     total_loss = 0.0
     total_count = 0
 
@@ -196,8 +228,9 @@ def evaluate_model(data_loader, model, loss_fn, batch_size_test, mse_loss_fn=Non
             else:
                 inputs, targets = batch
                 prev_values = None
-            inputs = inputs.permute(1, 0, 2)
-            targets = targets
+            inputs = _to_device(inputs, device).permute(1, 0, 2)
+            targets = _to_device(targets, device)
+            prev_values = _to_device(prev_values, device)
 
             if inputs.size(1) != batch_size_test:
                 batch_size_current = inputs.size(1)
@@ -223,6 +256,7 @@ def evaluate_model(data_loader, model, loss_fn, batch_size_test, mse_loss_fn=Non
 
 def evaluate_r2(data_loader, model, batch_size_test):
     model.eval()
+    device = _model_device(model)
     preds_all = []
     targets_all = []
 
@@ -234,7 +268,8 @@ def evaluate_r2(data_loader, model, batch_size_test):
                 inputs, targets, _ = batch
             else:
                 inputs, targets = batch
-            inputs = inputs.permute(1, 0, 2)
+            inputs = _to_device(inputs, device).permute(1, 0, 2)
+            targets = _to_device(targets, device)
 
             out = model(inputs)
             preds = out["output"]
@@ -275,6 +310,7 @@ class NormalizedErrorLoss(torch.nn.Module):
 
 def evaluate_normalized_error(data_loader, model, batch_size_test, epsilon=1e-8):
     model.eval()
+    device = _model_device(model)
     normalized_errors = []
     total_count = 0
 
@@ -285,7 +321,9 @@ def evaluate_normalized_error(data_loader, model, batch_size_test, epsilon=1e-8)
             else:
                 continue
             
-            inputs = inputs.permute(1, 0, 2)
+            inputs = _to_device(inputs, device).permute(1, 0, 2)
+            targets = _to_device(targets, device)
+            prev_values = _to_device(prev_values, device)
             
             if inputs.size(1) != batch_size_test:
                 batch_size_current = inputs.size(1)
@@ -311,6 +349,7 @@ def evaluate_normalized_error(data_loader, model, batch_size_test, epsilon=1e-8)
 
 def collect_all_test_predictions(test_loader, model, batch_size_test, test_start_idx, horizon):
     model.eval()
+    device = _model_device(model)
     all_predictions = []
     all_targets = []
     all_target_indices = []
@@ -326,7 +365,8 @@ def collect_all_test_predictions(test_loader, model, batch_size_test, test_start
                 inputs, targets = batch
                 sampled_indices = None
             
-            inputs = inputs.permute(1, 0, 2)
+            inputs = _to_device(inputs, device).permute(1, 0, 2)
+            targets = _to_device(targets, device)
             
             if inputs.size(1) != batch_size_test:
                 batch_size_current = inputs.size(1)
@@ -369,19 +409,21 @@ def train_with_params(
     lambda_param = lambda_value if lambda_value is not None else args.lambda_param
 
     model = build_oscillator(
-            args.dynamics,
-            1,
-            args.num_hidden,
-            1,
-            args.h,
-            args.alpha,
-            omega_value,
-            args.gamma,
-            lambda_param=lambda_param,
-            gamma_real=args.gamma_real,
-            gamma_imag=args.gamma_imag,
-            use_tanh=not args.no_tanh,
-        )
+        args.dynamics,
+        1,
+        args.num_hidden,
+        1,
+        args.h,
+        args.alpha,
+        omega_value,
+        args.gamma,
+        lambda_param=lambda_param,
+        gamma_real=args.gamma_real,
+        gamma_imag=args.gamma_imag,
+        use_tanh=not args.no_tanh,
+    )
+    device = resolve_device(getattr(args, "device", "cpu"))
+    model = model.to(device)
 
     mse_loss_fn = torch.nn.MSELoss()
     loss_fn = NormalizedErrorLoss(epsilon=1e-3, max_ratio=100.0, min_denominator=1e-4)
@@ -402,7 +444,7 @@ def train_with_params(
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if args.output_dir is not None:
+    if args.output_dir:
         output_dir = args.output_dir
         os.makedirs(output_dir, exist_ok=True)
     elif sweep_idx is not None:
@@ -501,6 +543,11 @@ def run_training(
     best_test_normalized = float("inf")
     best_val_mse = float("inf")
     best_test_mse = float("inf")
+    best_val_r2 = -float("inf")
+    best_test_r2 = -float("inf")
+    best_epoch = 0
+    patience_counter = 0
+    numerical_error = False
 
     train_losses = []
     val_losses = []
@@ -511,12 +558,13 @@ def run_training(
     test_normalized_errors = []
     grad_norms = []
     parameters_history = []
+    all_metrics = []
 
     if not args.skip_epoch_plots:
         print("Generating initial plots before training...")
         model.eval()
         with torch.no_grad():
-            ex_batch = example_input.unsqueeze(0)
+            ex_batch = _to_device(example_input.unsqueeze(0), _model_device(model))
             ex_batch = ex_batch.permute(1, 0, 2)
             ex_out = model(ex_batch)
             ex_pred = ex_out["output"][0, 0].item()
@@ -611,15 +659,17 @@ def run_training(
     if lambda_value is not None:
         param_str += f", lambda={lambda_value:.6f}"
 
-    for epoch in tqdm(range(args.epochs), total=args.epochs):
+    for epoch in tqdm(range(args.epochs), total=args.epochs, disable=args.sweep_mode):
         tqdm.write(f"epoch {epoch} ({param_str})")
+        fh_log.write(f"epoch {epoch} ({param_str}) starting\n")
+        fh_log.flush()
         model.train()
         epoch_loss = 0.0
         epoch_mse = 0.0
         count = 0
         epoch_grad_norms = []
 
-        for batch in train_loader:
+        for batch_idx, batch in enumerate(train_loader):
             if len(batch) == 4:
                 inputs, targets, _, prev_values = batch
             elif len(batch) == 3:
@@ -628,7 +678,10 @@ def run_training(
             else:
                 inputs, targets = batch
                 prev_values = None
-            inputs = inputs.permute(1, 0, 2)
+            device = _model_device(model)
+            inputs = _to_device(inputs, device).permute(1, 0, 2)
+            targets = _to_device(targets, device)
+            prev_values = _to_device(prev_values, device)
             optimizer.zero_grad()
             out = model(inputs)
             preds = out["output"]
@@ -648,8 +701,8 @@ def run_training(
                     f"ERROR: Training stopped at epoch {epoch} due to NaN/Inf loss\n"
                 )
                 fh_log.flush()
-                fh_log.close()
-                raise ValueError("NaN/Inf loss detected - training stopped")
+                numerical_error = True
+                break
 
             loss.backward()
             
@@ -669,6 +722,15 @@ def run_training(
             epoch_mse += mse_batch.item() * batch_size_current
             count += batch_size_current
             epoch_grad_norms.append(grad_norm.item())
+
+            if args.sweep_mode and batch_idx == 0:
+                msg = f"epoch {epoch}: first batch done (loss={loss.item():.6f})"
+                print(msg, flush=True)
+                fh_log.write(msg + "\n")
+                fh_log.flush()
+
+        if numerical_error:
+            break
 
         avg_train_mse = epoch_mse / max(count, 1)
         avg_grad_norm = np.mean(epoch_grad_norms) if epoch_grad_norms else 0.0
@@ -728,36 +790,25 @@ def run_training(
             "avg_grad_norm": float(avg_grad_norm) if np.isfinite(avg_grad_norm) else None,
             "learning_rate": float(current_lr),
         }
+        all_metrics.append(metrics_data)
+        atomic_write_json(metrics_file, all_metrics)
         
-        if os.path.exists(metrics_file):
-            with open(metrics_file, "r") as f:
-                all_metrics = json.load(f)
-            all_metrics.append(metrics_data)
-        else:
-            all_metrics = [metrics_data]
-        
-        with open(metrics_file, "w") as f:
-            json.dump(all_metrics, f, indent=2)
-        
-        if not args.sweep_mode:
-            model_params = extract_model_parameters(model, args.dynamics)
+        if not args.skip_epoch_plots:
+            model_params = extract_model_parameters(model, manifold_dynamics_type(args.dynamics))
             param_stats = compute_parameter_statistics(model_params)
             parameters_history.append({
                 "epoch": epoch,
                 "params": model_params,
                 "stats": param_stats
             })
-
-            params_file = f"{output_dir}/parameters.json"
-            with open(params_file, "w") as f:
-                json.dump(parameters_history, f, indent=2)
-
+            atomic_write_json(f"{output_dir}/parameters.json", parameters_history)
+        
         if not args.skip_epoch_plots:
             plot_mackey_glass_parameter_analysis(parameters_history, output_dir, epoch, fh_log=fh_log)
 
             model.eval()
             with torch.no_grad():
-                ex_batch = example_input.unsqueeze(0)
+                ex_batch = _to_device(example_input.unsqueeze(0), _model_device(model))
                 ex_batch = ex_batch.permute(1, 0, 2)
                 ex_out = model(ex_batch)
                 ex_pred = ex_out["output"][0, 0].item()
@@ -825,61 +876,19 @@ def run_training(
             except Exception as e:
                 tqdm.write(f"Warning: Failed to generate signal stage plots at epoch {epoch}: {e}")
 
-            try:
-                if args.encoding_grouping == "all":
-                    num_per_group = max(1, args.encoding_analysis_examples // 3)
-                else:
-                    num_per_group = max(1, args.encoding_analysis_examples // len(GROUP_LABELS[args.encoding_grouping]))
-                encoding_summaries = plot_mackey_glass_encoding_analysis_from_loader(
-                    model,
-                    test_loader,
-                    ep_dir,
-                    epoch,
-                    grouping=args.encoding_grouping,
-                    num_per_group=num_per_group,
-                    num_units_plot=min(5, args.num_hidden),
-                    tau_steps=tau_steps,
-                )
-                if args.encoding_grouping == "all":
-                    for group_mode, summary in encoding_summaries.items():
-                        fh_log.write(
-                            f"MG encoding ({group_mode}) epoch {epoch}: "
-                            f"dominant={summary.get('dominant_encoding', 'n/a')}, "
-                            f"magnitude_score={summary.get('magnitude_separation_score', 0):.3f}, "
-                            f"phase_score={summary.get('phase_separation_score', 0):.3f}, "
-                            f"frequency_score={summary.get('frequency_separation_score', 0):.3f}\n"
-                        )
-                        z_mag_nodes = summary.get("node_activity", {}).get("z_magnitude", {})
-                        if z_mag_nodes:
-                            fh_log.write(
-                                f"  top active |z| nodes ({group_mode}): {z_mag_nodes.get('top_active_nodes', [])}, "
-                                f"top discriminative |z| nodes: {z_mag_nodes.get('top_discriminative_nodes', [])}\n"
-                            )
-                else:
-                    summary = encoding_summaries
-                    fh_log.write(
-                        f"MG encoding epoch {epoch}: "
-                        f"dominant={summary.get('dominant_encoding', 'n/a')}, "
-                        f"magnitude_score={summary.get('magnitude_separation_score', 0):.3f}, "
-                        f"phase_score={summary.get('phase_separation_score', 0):.3f}, "
-                        f"frequency_score={summary.get('frequency_separation_score', 0):.3f}\n"
-                    )
-                    z_mag_nodes = summary.get("node_activity", {}).get("z_magnitude", {})
-                    if z_mag_nodes:
-                        fh_log.write(
-                            f"  top active |z| nodes: {z_mag_nodes.get('top_active_nodes', [])}, "
-                            f"top discriminative |z| nodes: {z_mag_nodes.get('top_discriminative_nodes', [])}\n"
-                        )
-                fh_log.flush()
-            except Exception as e:
-                tqdm.write(f"Warning: Failed to generate Mackey-Glass encoding analysis at epoch {epoch}: {e}")
-
-        is_best = val_normalized < best_val_normalized
+        # Select on val_r2: normalized error can worsen while MSE/R² improve.
+        is_best = np.isfinite(val_r2) and val_r2 > best_val_r2
         if is_best:
+            best_val_r2 = val_r2
             best_val_normalized = val_normalized
             best_test_normalized = test_normalized
             best_val_mse = val_mse
             best_test_mse = test_mse
+            best_test_r2 = test_r2
+            best_epoch = epoch
+            patience_counter = 0
+        else:
+            patience_counter += 1
 
         msg = (
             f"epoch {epoch}: train_normalized_error: {avg_train_normalized:.6f}, train_mse: {avg_train_mse:.6f}, "
@@ -888,7 +897,7 @@ def run_training(
             f"val_r2: {val_r2:.6f}, test_r2: {test_r2:.6f}, "
             f"grad_norm: {avg_grad_norm:.6f}, lr: {current_lr:.2e}"
         )
-        if val_normalized == best_val_normalized:
+        if is_best:
             msg += " [BEST]"
         fh_log.write(msg + "\n")
         fh_log.flush()
@@ -898,8 +907,8 @@ def run_training(
             save_training_checkpoint(model, output_dir, is_best=is_best)
             tqdm.write(f'wrote checkpoint last_model.pt{" + best_model.pt" if is_best else ""}')
 
-        if not args.skip_epoch_plots and epoch == args.epochs - 1:
-            ep_dir = epoch_dir(output_dir, epoch)
+        stopped_early = patience_counter >= args.early_stop_patience
+        if not args.skip_epoch_plots and (epoch == args.epochs - 1 or stopped_early):
             promote_epoch_artifacts(ep_dir, output_dir, {
                 f"mg_pred_epoch{epoch:02d}.png": "mg_pred.png",
                 f"mg_pred_epoch{epoch:02d}_zoom.png": "mg_pred_zoom.png",
@@ -909,7 +918,7 @@ def run_training(
                 f"predictions_on_test_epoch{epoch:02d}_avg.png": "predictions_on_test_avg.png",
             })
         
-        if args.analyze_manifold and not args.skip_epoch_plots:
+        if args.analyze_manifold and not args.skip_epoch_plots and not args.sweep_mode:
             try:
                 tqdm.write(f"\nRunning manifold dimension analysis at epoch {epoch}...")
                 manifold_results_epoch = analyze_manifold_dimension(
@@ -930,6 +939,19 @@ def run_training(
             except Exception as e:
                 tqdm.write(f"Warning: Manifold dimension analysis failed at epoch {epoch}: {e}")
 
+        if stopped_early:
+            tqdm.write(
+                f"Early stopping at epoch {epoch} "
+                f"(no val_r2 improvement for {args.early_stop_patience} epochs); "
+                f"best test_r2={best_test_r2:.4f} at epoch {best_epoch}"
+            )
+            fh_log.write(
+                f"early stop at epoch {epoch}: best test_r2={best_test_r2:.4f} "
+                f"(best_val_r2={best_val_r2:.6f}, best_epoch={best_epoch})\n"
+            )
+            fh_log.flush()
+            break
+
 
     if len(parameters_history) > 0 and not args.skip_epoch_plots:
         create_mackey_glass_gifs(output_dir)
@@ -937,9 +959,33 @@ def run_training(
 
     msg = f"best test_normalized_error: {best_test_normalized:.6f} (val_normalized_error: {best_val_normalized:.6f}), best test_mse: {best_test_mse:.6f} (val_mse: {best_val_mse:.6f})"
     fh_log.write(msg + "\n")
+    if np.isfinite(best_test_r2):
+        fh_log.write(f"best test_r2: {best_test_r2:.6f} (epoch {best_epoch})\n")
+        print(f"best test_r2: {best_test_r2:.6f}")
+    if numerical_error:
+        fh_log.write("WARNING: Training stopped due to numerical error (NaN/Inf)\n")
     fh_log.flush()
     
-    if args.analyze_manifold and not args.skip_epoch_plots:
+    if not all_metrics:
+        atomic_write_json(
+            f"{output_dir}/metrics.json",
+            [{
+                "epoch": -1,
+                "train_normalized_error": None,
+                "train_mse": None,
+                "val_normalized_error": None,
+                "test_normalized_error": None,
+                "val_mse": None,
+                "test_mse": None,
+                "val_r2": None,
+                "test_r2": 0.0 if numerical_error else None,
+                "avg_grad_norm": None,
+                "learning_rate": None,
+                "numerical_error": True,
+            }],
+        )
+    
+    if args.analyze_manifold and not args.skip_epoch_plots and not args.sweep_mode:
         print("\n" + "=" * 60)
         print("Computing final manifold dimension analysis...")
         print("=" * 60 + "\n")
@@ -1020,6 +1066,9 @@ def run_training(
             "best_test_normalized_error": best_test_normalized,
             "best_val_mse": best_val_mse,
             "best_test_mse": best_test_mse,
+            "best_test_r2": float(best_test_r2) if np.isfinite(best_test_r2) else 0.0,
+            "best_epoch": int(best_epoch),
+            "numerical_error": bool(numerical_error),
         }
     else:
         return {
@@ -1028,6 +1077,9 @@ def run_training(
             "best_test_normalized_error": best_test_normalized,
             "best_val_mse": best_val_mse,
             "best_test_mse": best_test_mse,
+            "best_test_r2": float(best_test_r2) if np.isfinite(best_test_r2) else 0.0,
+            "best_epoch": int(best_epoch),
+            "numerical_error": bool(numerical_error),
         }
 
 
@@ -1041,7 +1093,7 @@ def main():
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--h", type=float, default=1.0)
-    parser.add_argument("--alpha", type=float, default=0.05)
+    parser.add_argument("--alpha", type=float, default=0.04)
     parser.add_argument("--omega", type=float, default=0.224)
     parser.add_argument("--gamma", type=float, default=0.01)
     parser.add_argument("--lambda-param", type=float, default=-0.04)
@@ -1049,6 +1101,8 @@ def main():
     parser.add_argument("--gamma-imag", type=float, default=0.1)
     parser.add_argument("--dynamics", type=str, default="sl", choices=["sl", "lo", "dho"])
     parser.add_argument("--no-tanh", action="store_true")
+    parser.add_argument("--sweep-mode", action="store_true")
+    parser.add_argument("--output-dir", type=str, default=None)
 
     parser.add_argument("--sweep-omega", action="store_true")
     parser.add_argument("--omega-min", type=float, default=None)
@@ -1082,25 +1136,24 @@ def main():
                         help="Enable manifold dimension analysis (runs at end of training and every 10 epochs)", default=True)
     parser.add_argument("--skip-epoch-plots", action="store_true",
                         help="Skip per-epoch plots and manifold analysis (metrics still saved)")
-    parser.add_argument("--encoding-analysis-examples", type=int, default=50,
-                        help="Number of test examples per forecast group for encoding analysis")
-    parser.add_argument("--encoding-grouping", type=str, default="all",
-                        choices=["error", "target", "trend", "all"],
-                        help="How to group Mackey-Glass forecasts for encoding analysis")
-    parser.add_argument("--sweep-mode", action="store_true",
-                        help="Minimal sweep outputs: only log.txt (parameters + metrics) and metrics.json")
-    parser.add_argument("--output-dir", type=str, default=None,
-                        help="Explicit output directory for this run (overrides timestamped default)")
+    parser.add_argument("--early-stop-patience", type=int, default=5,
+                        help="stop after this many epochs without val_r2 improvement (default: 5)")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cpu",
+        choices=["auto", "cpu", "cuda"],
+        help="compute device (default: cpu; use cuda with cluster -g 1)",
+    )
 
     args = parser.parse_args()
-
-    if args.sweep_mode:
-        args.skip_epoch_plots = True
 
     if args.sweep_omega and args.sweep_lambda:
         raise ValueError("Cannot sweep both omega and lambda simultaneously.")
 
-    torch.manual_seed(args.seed)
+    device = resolve_device(args.device)
+    seed_all(args.seed, device)
+    print(f"Using device: {device}")
 
     if args.sweep_omega:
         if args.omega_min is None or args.omega_max is None:

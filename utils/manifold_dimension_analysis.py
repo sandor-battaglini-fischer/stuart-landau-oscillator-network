@@ -22,6 +22,7 @@ def collect_hidden_states(data_loader, model, dynamics_type, max_samples=10000, 
     all_states = []
     all_timesteps = []
     sample_count = 0
+    device = next(model.parameters()).device
 
     with torch.no_grad():
         for batch in data_loader:
@@ -33,7 +34,7 @@ def collect_hidden_states(data_loader, model, dynamics_type, max_samples=10000, 
                     inputs = batch[0]
                 else:
                     continue
-                out = model(inputs, record=True)
+                out = model(inputs.to(device, non_blocking=True), record=True)
             else:
                 if len(batch) >= 2:
                     inputs = batch[0]
@@ -49,7 +50,7 @@ def collect_hidden_states(data_loader, model, dynamics_type, max_samples=10000, 
                 elif len(inputs.shape) == 2:
                     inputs = inputs.unsqueeze(-1).permute(1, 0, 2)
 
-                out = model(inputs, record=True)
+                out = model(inputs.to(device, non_blocking=True), record=True)
 
             if dynamics_type == "dho":
                 x_t = out.get('rec_x_t', None)
@@ -85,6 +86,31 @@ def collect_hidden_states(data_loader, model, dynamics_type, max_samples=10000, 
         return None, None
 
     return np.array(all_states), np.array(all_timesteps)
+
+
+def compute_participation_ratio(eigenvalues):
+    lam = np.asarray(eigenvalues, dtype=float)
+    lam = lam[np.isfinite(lam)]
+    lam = np.clip(lam, 0.0, None)
+    s2 = float(np.dot(lam, lam))
+    if s2 <= 0.0:
+        return 0.0
+    s1 = float(lam.sum())
+    return float((s1 * s1) / s2)
+
+
+def participation_ratio_from_states(hidden_states):
+    if hidden_states is None or len(hidden_states) == 0:
+        return None
+    x = np.asarray(hidden_states, dtype=float)
+    if x.ndim != 2 or x.shape[0] < 2 or x.shape[1] < 1:
+        return None
+    cov = np.cov(x, rowvar=False)
+    if np.ndim(cov) == 0:
+        evals = np.asarray([float(cov)])
+    else:
+        evals = np.linalg.eigvalsh(cov)
+    return compute_participation_ratio(evals)
 
 
 def compute_pca_dimension(hidden_states, variance_threshold=0.95):
@@ -485,6 +511,7 @@ def compute_lyapunov_exponents(data_loader, model, dynamics_type, output_dir,
     model.eval()
     reference_data = []
     sample_count = 0
+    device = next(model.parameters()).device
 
     with torch.no_grad():
         for batch in data_loader:
@@ -511,7 +538,7 @@ def compute_lyapunov_exponents(data_loader, model, dynamics_type, output_dir,
                 elif len(inputs.shape) == 2:
                     inputs = inputs.unsqueeze(-1).permute(1, 0, 2)
 
-            reference_data.append(inputs)
+            reference_data.append(inputs.to(device, non_blocking=True))
             sample_count += 1
             if sample_count >= n_trajectories:
                 break
@@ -647,7 +674,8 @@ def plot_lyapunov_exponents(lyapunov_exponents, divergence_rates, output_dir, ep
 
 def analyze_manifold_dimension(data_loader, model, dynamics_type, output_dir, epoch=None,
                                batch_size_test=64, max_samples=10000,
-                               variance_threshold=0.95, is_imdb=False):
+                               variance_threshold=0.95, is_imdb=False,
+                               lightweight=False):
     print("Collecting hidden states...")
     hidden_states, timesteps = collect_hidden_states(
         data_loader, model, dynamics_type, max_samples=max_samples,
@@ -664,41 +692,53 @@ def analyze_manifold_dimension(data_loader, model, dynamics_type, output_dir, ep
     effective_dim, explained_variance, pca = compute_pca_dimension(
         hidden_states, variance_threshold=variance_threshold
     )
+    if pca is not None and hasattr(pca, "explained_variance_"):
+        participation_ratio = compute_participation_ratio(pca.explained_variance_)
+    else:
+        participation_ratio = participation_ratio_from_states(hidden_states)
 
-    print("Computing correlation dimension...")
-    correlation_dim, _, _, log_r, log_c_r = compute_correlation_dimension(
-        hidden_states, n_samples_max=min(5000, len(hidden_states))
-    )
+    correlation_dim = None
+    log_r = None
+    log_c_r = None
+    lyap_results = None
+    if not lightweight:
+        print("Computing correlation dimension...")
+        correlation_dim, _, _, log_r, log_c_r = compute_correlation_dimension(
+            hidden_states, n_samples_max=min(5000, len(hidden_states))
+        )
 
-    print("Generating plots...")
-    if explained_variance is not None and effective_dim is not None:
-        plot_pca_analysis(explained_variance, effective_dim, output_dir, epoch=epoch)
-        plot_state_space(hidden_states, pca, output_dir, epoch=epoch, timesteps=timesteps)
+        print("Generating plots...")
+        if explained_variance is not None and effective_dim is not None:
+            plot_pca_analysis(explained_variance, effective_dim, output_dir, epoch=epoch)
+            plot_state_space(hidden_states, pca, output_dir, epoch=epoch, timesteps=timesteps)
 
-    if log_r is not None and log_c_r is not None:
-        plot_correlation_dimension(log_r, log_c_r, correlation_dim, output_dir, epoch=epoch)
+        if log_r is not None and log_c_r is not None:
+            plot_correlation_dimension(log_r, log_c_r, correlation_dim, output_dir, epoch=epoch)
 
-    print("Computing Lyapunov exponents...")
-    _, lyap_results = compute_lyapunov_exponents(
-        data_loader, model, dynamics_type, output_dir,
-        epoch=epoch, batch_size_test=batch_size_test,
-        n_trajectories=20, n_steps=50, is_imdb=is_imdb
-    )
+        print("Computing Lyapunov exponents...")
+        _, lyap_results = compute_lyapunov_exponents(
+            data_loader, model, dynamics_type, output_dir,
+            epoch=epoch, batch_size_test=batch_size_test,
+            n_trajectories=20, n_steps=50, is_imdb=is_imdb
+        )
 
     results = {
         'effective_dim_pca': int(effective_dim) if effective_dim is not None else None,
+        'participation_ratio': float(participation_ratio) if participation_ratio is not None else None,
         'correlation_dim': float(correlation_dim) if correlation_dim is not None else None,
         'n_samples': int(len(hidden_states)),
         'state_dim': int(hidden_states.shape[1]),
-        'explained_variance_95': float(explained_variance[effective_dim - 1]) if effective_dim is not None and effective_dim > 0 else None,
+        'explained_variance_95': float(explained_variance[effective_dim - 1]) if explained_variance is not None and effective_dim is not None and effective_dim > 0 else None,
     }
     if lyap_results is not None:
         results.update(lyap_results)
 
     print(f"PCA effective dimension: {effective_dim}")
-    print(f"Correlation dimension: {correlation_dim}")
-    if lyap_results is not None:
-        print(f"Largest Lyapunov exponent: {lyap_results.get('largest_lyapunov_exponent', 'N/A')}")
+    print(f"Participation ratio: {participation_ratio}")
+    if not lightweight:
+        print(f"Correlation dimension: {correlation_dim}")
+        if lyap_results is not None:
+            print(f"Largest Lyapunov exponent: {lyap_results.get('largest_lyapunov_exponent', 'N/A')}")
 
     return results
 

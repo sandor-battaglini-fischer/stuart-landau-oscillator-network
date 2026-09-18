@@ -11,11 +11,12 @@ import json
 
 import sys
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(PROJECT_ROOT)
+sys.path.insert(0, PROJECT_ROOT)
 DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
 TASK = 'smnist'
 
 from utils.model_factory import build_oscillator, manifold_dynamics_type
+from utils.device import resolve_device, seed_all
 from utils.run_dirs import make_run_dir, sweep_summary_path, epoch_dir, save_training_checkpoint
 from utils.slon_analysis import extract_model_parameters, compute_parameter_statistics
 from utils.plotting_utils import (
@@ -31,7 +32,25 @@ from utils.manifold_dimension_analysis import analyze_manifold_dimension, collec
 parser = argparse.ArgumentParser(description='SLON training script for sMNIST')
 parser.add_argument('--num-hidden', type=int, default=50, help='number of units')
 parser.add_argument('--epochs', type=int, default=20, help='number of training epochs')
+parser.add_argument('--early-stop-patience', type=int, default=5,
+                    help='early stopping patience on validation accuracy (default: 5)')
 parser.add_argument('--batch-size', type=int, default=64, help='batch size')
+parser.add_argument(
+    '--train-fraction',
+    type=float,
+    default=1.0,
+    help='class-balanced fraction of the MNIST train split to use (test set untouched; default: 1.0)',
+)
+parser.add_argument(
+    '--log-train-acc',
+    action='store_true',
+    help='evaluate train accuracy every epoch even in --sweep-mode',
+)
+parser.add_argument(
+    '--analyze-manifold-final',
+    action='store_true',
+    help='run lightweight manifold analysis at the end even in --sweep-mode',
+)
 parser.add_argument('--shuffle', action = 'store_true', help='whether to shuffle stimulus time steps')
 parser.add_argument('--seed', type=int, default=1, help='random seed')
 parser.add_argument('--lr', type=float, default=1e-2, help='learning rate')
@@ -62,6 +81,8 @@ parser.add_argument('--output-dir', type=str, default=None,
                     help='Explicit output directory for this run (overrides timestamped default)')
 parser.add_argument('--digit-analysis-examples', type=int, default=20,
                     help='number of test examples per digit for digit encoding analysis')
+parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cpu', 'cuda'],
+                    help='compute device (default: auto)')
 
 args = parser.parse_args()
 
@@ -79,9 +100,12 @@ if args.lambda_param > 0:
 
 print(args)
 print(f"Using {args.dynamics} dynamics")
+if not 0.0 < args.train_fraction <= 1.0:
+    raise ValueError(f"--train-fraction must be in (0, 1], got {args.train_fraction}")
 
-# fix seed
-torch.manual_seed(args.seed)
+device = resolve_device(args.device)
+seed_all(args.seed, device)
+print(f"Using device: {device}")
 
 # sMNIST as 1-dim time series
 dim_input = 1
@@ -97,16 +121,49 @@ batch_size_test = 1000
 if args.shuffle:
     perm = torch.randperm(784)
 
+def _mnist_targets(dataset):
+    if isinstance(dataset, torch.utils.data.Subset):
+        return np.asarray(_mnist_targets(dataset.dataset))[np.asarray(dataset.indices)]
+    if hasattr(dataset, "targets"):
+        return np.asarray(dataset.targets)
+    if hasattr(dataset, "labels"):
+        return np.asarray(dataset.labels)
+    return np.array([dataset[i][1] for i in range(len(dataset))])
+
+
+def class_balanced_subsample(dataset, fraction, seed, n_classes=10):
+    if fraction >= 1.0 - 1e-12:
+        return dataset
+    rng = np.random.RandomState(seed)
+    labels = _mnist_targets(dataset)
+    n_keep = max(n_classes, int(round(fraction * len(dataset))))
+    per_class = n_keep // n_classes
+    remainder = n_keep - per_class * n_classes
+    chosen = []
+    for c in range(n_classes):
+        class_idx = np.flatnonzero(labels == c)
+        rng.shuffle(class_idx)
+        n_c = per_class + (1 if c < remainder else 0)
+        n_c = min(n_c, len(class_idx))
+        if n_c == 0:
+            raise ValueError(f"class {c} has no examples to subsample")
+        chosen.extend(class_idx[:n_c].tolist())
+    rng.shuffle(chosen)
+    return torch.utils.data.Subset(dataset, chosen)
+
 # load dataset
 size_validation = 1000 # size of validation dataset
 train_set = torchvision.datasets.MNIST(root=DATA_DIR, train=True, transform=torchvision.transforms.ToTensor(), download=False)
 test_set = torchvision.datasets.MNIST(root=DATA_DIR, train=False, transform=torchvision.transforms.ToTensor(), download=False)
 train_set, valid_set = torch.utils.data.random_split(train_set, [len(train_set) - size_validation, size_validation])
+if args.train_fraction < 1.0:
+    train_set = class_balanced_subsample(train_set, args.train_fraction, args.seed)
+print(f"train examples: {len(train_set)} (train_fraction={args.train_fraction})")
 
 # data loaders
-train_loader = torch.utils.data.DataLoader(dataset=train_set, batch_size=batch_size_train, shuffle=True)
-valid_loader = torch.utils.data.DataLoader(dataset=valid_set, batch_size=batch_size_test, shuffle=False)
-test_loader = torch.utils.data.DataLoader(dataset=test_set, batch_size=batch_size_test, shuffle=False)
+train_loader = torch.utils.data.DataLoader(dataset=train_set, batch_size=batch_size_train, shuffle=True, pin_memory=device.type == "cuda")
+valid_loader = torch.utils.data.DataLoader(dataset=valid_set, batch_size=batch_size_test, shuffle=False, pin_memory=device.type == "cuda")
+test_loader = torch.utils.data.DataLoader(dataset=test_set, batch_size=batch_size_test, shuffle=False, pin_memory=device.type == "cuda")
 
 def train_with_params(omega_value, lambda_value=None, sweep_idx=None, sweep_type=None):
     lambda_param = lambda_value if lambda_value is not None else args.lambda_param
@@ -116,12 +173,13 @@ def train_with_params(omega_value, lambda_value=None, sweep_idx=None, sweep_type
         lambda_param=lambda_param, gamma_real=args.gamma_real, gamma_imag=args.gamma_imag,
         use_tanh=not args.no_tanh,
     )
+    model = model.to(device)
 
     loss = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr = args.lr)
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    if args.output_dir is not None:
+    if args.output_dir:
         output_dir = args.output_dir
         os.makedirs(output_dir, exist_ok=True)
     elif sweep_idx is not None:
@@ -143,7 +201,12 @@ def train_with_params(omega_value, lambda_value=None, sweep_idx=None, sweep_type
     fh_log.write(f'use_tanh: {not args.no_tanh}\n')
     fh_log.write(f'num_hidden: {args.num_hidden}\n')
     fh_log.write(f'epochs: {args.epochs}\n')
+    fh_log.write(f'early_stop_patience: {args.early_stop_patience}\n')
     fh_log.write(f'batch_size: {args.batch_size}\n')
+    fh_log.write(f'train_fraction: {args.train_fraction}\n')
+    fh_log.write(f'n_train: {len(train_set)}\n')
+    fh_log.write(f'n_valid: {len(valid_set)}\n')
+    fh_log.write(f'n_test: {len(test_set)}\n')
     fh_log.write(f'shuffle: {args.shuffle}\n')
     fh_log.write(f'seed: {args.seed}\n')
     fh_log.write(f'lr: {args.lr}\n')
@@ -170,9 +233,10 @@ def evaluate_model(data_loader, model, loss, output_dir, epoch = None, batch = N
     with torch.no_grad():
         # loop over batches in data loader
         for i, (images, labels) in enumerate(data_loader):
+            labels = labels.to(device, non_blocking=True)
             # reshape batch
-            images = images.reshape(batch_size_test, 1, 784)
-            images = images.permute(2, 0, 1)
+            images = images.reshape(-1, 1, 784)
+            images = images.permute(2, 0, 1).to(device, non_blocking=True)
 
             if args.shuffle:
                 images = images[perm, :, :]
@@ -209,6 +273,8 @@ def run_training(omega_value, lambda_value=None, sweep_idx=None, sweep_type=None
     
     best_eval = 0.
     final_test_acc = 0.
+    best_epoch = -1
+    patience_counter = 0
     parameters_history = []
     
     train_accs = []
@@ -239,16 +305,20 @@ def run_training(omega_value, lambda_value=None, sweep_idx=None, sweep_type=None
     for epoch in tqdm(range(args.epochs), total = args.epochs):
         tqdm.write(f'epoch {epoch} ({param_str})')
 
+        epoch_train_loss = 0.0
+        epoch_train_n = 0
+
         # loop over batches for one epoch
         for batch, (images, labels) in tqdm(enumerate(train_loader), total = len(train_loader)):
             # set model into train mode
             model.train()
+            labels = labels.to(device, non_blocking=True)
 
             # reshape samples
             images = images.reshape(-1, 1, 784)
 
             # dimensions: time x batch x 1
-            images = images.permute(2, 0, 1)
+            images = images.permute(2, 0, 1).to(device, non_blocking=True)
 
             if args.shuffle:
                 # shuffle if requested
@@ -270,67 +340,91 @@ def run_training(omega_value, lambda_value=None, sweep_idx=None, sweep_type=None
             # update parameters
             optimizer.step()
 
-        # compute validation and test accuracy
-        model.eval()
-        train_correct = 0
-        train_total = 0
-        train_loss_sum = 0.0
-        
-        with torch.no_grad():
-            for images, labels in train_loader:
-                images = images.reshape(-1, 1, 784)
-                images = images.permute(2, 0, 1)
-                if args.shuffle:
-                    images = images[perm, :, :]
-                output = model(images)
-                prediction = output['output']
-                train_loss_batch = loss_fn(prediction, labels)
-                train_loss_sum += train_loss_batch.item() * len(labels)
-                pred_label = prediction.data.max(1, keepdim=True)[1]
-                train_correct += pred_label.eq(labels.data.view_as(pred_label)).sum()
-                train_total += len(labels)
-        
-        train_acc = (100. * train_correct / train_total).item()
-        train_loss_avg = train_loss_sum / train_total
-        
-        valid_acc = evaluate_model(valid_loader, model, loss_fn, output_dir)
-        test_acc, test_preds, test_labels = evaluate_model(test_loader, model, loss_fn, output_dir, epoch, batch, return_predictions=True)
-        
-        model.eval()
-        val_loss_sum = 0.0
-        val_total = 0
-        with torch.no_grad():
-            for images, labels in valid_loader:
-                images = images.reshape(batch_size_test, 1, 784)
-                images = images.permute(2, 0, 1)
-                if args.shuffle:
-                    images = images[perm, :, :]
-                output = model(images)
-                prediction = output['output']
-                val_loss_batch = loss_fn(prediction, labels)
-                val_loss_sum += val_loss_batch.item() * len(labels)
-                val_total += len(labels)
-        val_loss_avg = val_loss_sum / val_total
-        
-        test_loss_sum = 0.0
-        test_total = 0
-        with torch.no_grad():
-            for images, labels in test_loader:
-                images = images.reshape(batch_size_test, 1, 784)
-                images = images.permute(2, 0, 1)
-                if args.shuffle:
-                    images = images[perm, :, :]
-                output = model(images)
-                prediction = output['output']
-                test_loss_batch = loss_fn(prediction, labels)
-                test_loss_sum += test_loss_batch.item() * len(labels)
-                test_total += len(labels)
-        test_loss_avg = test_loss_sum / test_total
+            epoch_train_loss += train_loss.item() * len(labels)
+            epoch_train_n += len(labels)
+
+        train_loss_avg = epoch_train_loss / max(epoch_train_n, 1)
+
+        if args.sweep_mode:
+            if args.log_train_acc:
+                train_acc = evaluate_model(train_loader, model, loss_fn, output_dir)
+            else:
+                train_acc = float("nan")
+            valid_acc = evaluate_model(valid_loader, model, loss_fn, output_dir)
+            test_acc = evaluate_model(test_loader, model, loss_fn, output_dir, epoch, batch)
+            test_preds = test_labels = None
+            val_loss_avg = float("nan")
+            test_loss_avg = float("nan")
+        else:
+            model.eval()
+            train_correct = 0
+            train_total = 0
+            train_loss_sum = 0.0
+
+            with torch.no_grad():
+                for images, labels in train_loader:
+                    labels = labels.to(device, non_blocking=True)
+                    images = images.reshape(-1, 1, 784)
+                    images = images.permute(2, 0, 1).to(device, non_blocking=True)
+                    if args.shuffle:
+                        images = images[perm, :, :]
+                    output = model(images)
+                    prediction = output['output']
+                    train_loss_batch = loss_fn(prediction, labels)
+                    train_loss_sum += train_loss_batch.item() * len(labels)
+                    pred_label = prediction.data.max(1, keepdim=True)[1]
+                    train_correct += pred_label.eq(labels.data.view_as(pred_label)).sum()
+                    train_total += len(labels)
+
+            train_acc = (100. * train_correct / train_total).item()
+            train_loss_avg = train_loss_sum / train_total
+
+            valid_acc = evaluate_model(valid_loader, model, loss_fn, output_dir)
+            test_acc, test_preds, test_labels = evaluate_model(
+                test_loader, model, loss_fn, output_dir, epoch, batch, return_predictions=True
+            )
+
+            model.eval()
+            val_loss_sum = 0.0
+            val_total = 0
+            with torch.no_grad():
+                for images, labels in valid_loader:
+                    labels = labels.to(device, non_blocking=True)
+                    images = images.reshape(-1, 1, 784)
+                    images = images.permute(2, 0, 1).to(device, non_blocking=True)
+                    if args.shuffle:
+                        images = images[perm, :, :]
+                    output = model(images)
+                    prediction = output['output']
+                    val_loss_batch = loss_fn(prediction, labels)
+                    val_loss_sum += val_loss_batch.item() * len(labels)
+                    val_total += len(labels)
+            val_loss_avg = val_loss_sum / val_total
+
+            test_loss_sum = 0.0
+            test_total = 0
+            with torch.no_grad():
+                for images, labels in test_loader:
+                    labels = labels.to(device, non_blocking=True)
+                    images = images.reshape(-1, 1, 784)
+                    images = images.permute(2, 0, 1).to(device, non_blocking=True)
+                    if args.shuffle:
+                        images = images[perm, :, :]
+                    output = model(images)
+                    prediction = output['output']
+                    test_loss_batch = loss_fn(prediction, labels)
+                    test_loss_sum += test_loss_batch.item() * len(labels)
+                    test_total += len(labels)
+            test_loss_avg = test_loss_sum / test_total
         
         is_best = valid_acc > best_eval
         if is_best:
             best_eval = valid_acc
             final_test_acc = test_acc
+            best_epoch = epoch
+            patience_counter = 0
+        else:
+            patience_counter += 1
 
         train_accs.append(train_acc)
         val_accs.append(valid_acc)
@@ -369,7 +463,7 @@ def run_training(omega_value, lambda_value=None, sweep_idx=None, sweep_type=None
                     test_preds=test_preds,
                     parameters_history=parameters_history,
                     num_classes=10,
-                    is_last_epoch=(epoch == args.epochs - 1),
+                    is_last_epoch=(epoch == args.epochs - 1 or patience_counter >= args.early_stop_patience),
                 )
                 if cm is not None:
                     per_class_acc = cm.diagonal() / (cm.sum(axis=1) + 1e-10)
@@ -480,15 +574,25 @@ def run_training(omega_value, lambda_value=None, sweep_idx=None, sweep_type=None
             save_training_checkpoint(model, output_dir, is_best=is_best)
             tqdm.write(f'wrote checkpoint last_model.pt{" + best_model.pt" if is_best else ""}')
 
+        if patience_counter >= args.early_stop_patience:
+            tqdm.write(
+                f'Early stopping at epoch {epoch}. Best validation: {best_eval:.4f} at epoch {best_epoch}'
+            )
+            msg_stop = (
+                f'Early stopping at epoch {epoch}. Best validation: {best_eval:.4f} at epoch {best_epoch}'
+            )
+            fh_log.write(msg_stop + '\n')
+            fh_log.flush()
+            break
+
     
-    msg = f'best test: {final_test_acc:.2f} (val: {best_eval:.2f})'
+    msg = f'best test: {final_test_acc:.2f} (at epoch {best_epoch}, val: {best_eval:.2f})'
     fh_log.write(msg + '\n')
     fh_log.flush()
     
     if len(parameters_history) > 0 and not args.skip_epoch_plots:
         create_classification_gifs(output_dir)
     
-    # final manifold dimension analysis
     if args.analyze_manifold and not args.skip_epoch_plots:
         print("\n" + "=" * 60)
         print("Computing final manifold dimension analysis...")
@@ -515,6 +619,7 @@ def run_training(omega_value, lambda_value=None, sweep_idx=None, sweep_type=None
                 fh_log.write("Manifold Dimension Analysis Results:\n")
                 fh_log.write("=" * 60 + "\n")
                 fh_log.write(f"PCA effective dimension (95% variance): {manifold_results['effective_dim_pca']}\n")
+                fh_log.write(f"Participation ratio: {manifold_results.get('participation_ratio')}\n")
                 fh_log.write(f"Correlation dimension: {manifold_results['correlation_dim']:.4f}\n" if manifold_results['correlation_dim'] is not None else "Correlation dimension: N/A\n")
                 fh_log.write(f"State space dimension: {manifold_results['state_dim']}\n")
                 fh_log.write(f"Number of samples analyzed: {manifold_results['n_samples']}\n")
@@ -524,6 +629,8 @@ def run_training(omega_value, lambda_value=None, sweep_idx=None, sweep_type=None
                 
                 print(f"Manifold dimension analysis complete!")
                 print(f"  PCA effective dimension: {manifold_results['effective_dim_pca']}")
+                if manifold_results.get('participation_ratio') is not None:
+                    print(f"  Participation ratio: {manifold_results['participation_ratio']:.4f}")
                 if manifold_results['correlation_dim'] is not None:
                     print(f"  Correlation dimension: {manifold_results['correlation_dim']:.4f}")
                 print(f"  State space dimension: {manifold_results['state_dim']}")
@@ -553,6 +660,45 @@ def run_training(omega_value, lambda_value=None, sweep_idx=None, sweep_type=None
             print(f"Warning: Failed to collect final states or create animation: {e}")
             fh_log.write(f"\nWarning: Failed to collect final states: {e}\n")
             fh_log.flush()
+    elif args.analyze_manifold_final:
+        save_training_checkpoint(model, output_dir, is_best=False)
+        print("\n" + "=" * 60)
+        print("Computing lightweight manifold dimension analysis...")
+        print("=" * 60 + "\n")
+        try:
+            manifold_results = analyze_manifold_dimension(
+                test_loader,
+                model,
+                manifold_dynamics_type(args.dynamics),
+                output_dir,
+                epoch=None,
+                batch_size_test=batch_size_test,
+                max_samples=5000,
+                variance_threshold=0.95,
+                lightweight=True,
+            )
+            if manifold_results is not None:
+                manifold_file = f"{output_dir}/manifold_dimension_results.json"
+                with open(manifold_file, "w") as f:
+                    json.dump(manifold_results, f, indent=2)
+                fh_log.write("\n" + "=" * 60 + "\n")
+                fh_log.write("Manifold Dimension Analysis Results:\n")
+                fh_log.write("=" * 60 + "\n")
+                fh_log.write(f"PCA effective dimension (95% variance): {manifold_results['effective_dim_pca']}\n")
+                fh_log.write(f"Participation ratio: {manifold_results.get('participation_ratio')}\n")
+                fh_log.write(f"State space dimension: {manifold_results['state_dim']}\n")
+                fh_log.write(f"Number of samples analyzed: {manifold_results['n_samples']}\n")
+                fh_log.write("=" * 60 + "\n")
+                fh_log.flush()
+                print(f"  PCA effective dimension: {manifold_results['effective_dim_pca']}")
+                if manifold_results.get('participation_ratio') is not None:
+                    print(f"  Participation ratio: {manifold_results['participation_ratio']:.4f}")
+        except Exception as e:
+            import traceback
+            error_msg = f"Error during manifold dimension analysis: {e}\n{traceback.format_exc()}"
+            fh_log.write(f"\n{error_msg}\n")
+            fh_log.flush()
+            print(f"Error during manifold dimension analysis: {e}")
     
     fh_log.close()
     
