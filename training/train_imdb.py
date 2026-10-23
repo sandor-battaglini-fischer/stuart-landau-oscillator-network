@@ -51,7 +51,7 @@ parser.add_argument('--seed', type=int, default=1, help='random seed')
 parser.add_argument('--lr', type=float, default=1e-3, help='learning rate')
 parser.add_argument('--h', type=float, default=1.0, help='microscopic time constant h (default: 1)')
 parser.add_argument('--alpha', type=float, default=0.5, help='excitability coefficient alpha')
-parser.add_argument('--omega', type=float, default=0.224, help='natural frequency omega')
+parser.add_argument('--omega', type=float, default=None, help='natural frequency omega (default: one period over max-len)')
 parser.add_argument('--gamma', type=float, default=0.01, help='damping coefficient gamma')
 parser.add_argument('--lambda-param', type=float, default=-0.05, help='Stuart-Landau: real part of linear coefficient lambda (default: -|gamma|)')
 parser.add_argument('--gamma-real', type=float, default=-0.1, help='Stuart-Landau: real part of nonlinear coefficient (default: -0.1)')
@@ -381,7 +381,7 @@ if __name__ == '__main__':
     if sweep_count > 1:
         raise ValueError("Cannot sweep multiple parameters simultaneously. Choose one sweep type.")
 
-    if not args.sweep_omega:
+    if args.omega is None:
         args.omega = (2 * math.pi) / (target_period * args.h)
         print(f"Auto-adjusted omega to {args.omega:.6f} for period length {target_period} (sequence length)")
 
@@ -651,13 +651,13 @@ if __name__ == '__main__':
         # compute loss and accuracy
         test_loss /= len(data_loader)
         accuracy = 100. * correct / len(data_loader.dataset)
-        
+        accuracy = accuracy.item() if hasattr(accuracy, "item") else float(accuracy)
+
         if return_predictions:
-            all_preds = np.concatenate(all_preds)
-            all_labels = np.concatenate(all_labels)
-            return accuracy.item(), all_preds, all_labels
-        else:
-            return accuracy.item()
+            all_preds = np.concatenate(all_preds) if all_preds else np.array([])
+            all_labels = np.concatenate(all_labels) if all_labels else np.array([])
+            return accuracy, all_preds, all_labels
+        return accuracy
 
 
 
@@ -707,8 +707,11 @@ if __name__ == '__main__':
             tqdm.write(f'epoch {epoch} ({param_str})')
             
             epoch_train_loss = 0.0
+            n_train_batches = 0
+            n_skipped_batches = 0
 
             for batch_idx, (token_ids, labels) in tqdm(enumerate(train_loader), total = len(train_loader)):
+                n_train_batches += 1
                 model.train()
                 token_ids = token_ids.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
@@ -730,6 +733,7 @@ if __name__ == '__main__':
                     fh_log.write(msg + '\n')
                     fh_log.flush()
                     optimizer.zero_grad()
+                    n_skipped_batches += 1
                     continue
 
                 epoch_train_loss += train_loss.item()
@@ -743,6 +747,13 @@ if __name__ == '__main__':
                 if not args.sweep_mode and batch_idx % 100 == 0:
                     test_acc = evaluate_model(test_loader, model, loss_fn, output_dir, epoch, batch_idx)
                     tqdm.write(f'epoch {epoch} batch {batch_idx}: test acc {test_acc:.2f}, loss: {train_loss.item():.4f}')
+
+            if n_train_batches and n_skipped_batches == n_train_batches:
+                msg = f'epoch {epoch}: all batches NaN/Inf, stopping'
+                tqdm.write(msg)
+                fh_log.write(msg + '\n')
+                fh_log.flush()
+                break
 
             avg_train_loss = epoch_train_loss / len(train_loader)
 

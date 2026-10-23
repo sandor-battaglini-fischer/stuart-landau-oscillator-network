@@ -65,7 +65,7 @@ class TaskConfig:
 
 TASKS: dict[str, TaskConfig] = {
     "imdb": TaskConfig(
-        name="IMDB",
+        name="IMDb",
         output_glob="results/imdb/*",
         metric_label=r"Test accuracy ($\%$)",
         epoch_ylabel=r"Test accuracy ($\%$)",
@@ -117,7 +117,7 @@ TASKS: dict[str, TaskConfig] = {
         epoch_ylabel=r"Test $R^2$",
         use_r2=True,
         random_guess=0.0,
-        ylim=(0.0, 1.0),
+        ylim=(-0.5, 1.0),
         default_hidden=list(DEFAULT_HIDDEN),
         base_cmd=[
             sys.executable,
@@ -534,9 +534,9 @@ def plot_horizon_scaling_performance(
     ax.set_xscale("log")
     ax.set_xlabel(r"$N$ (hidden units)")
     ax.set_ylabel(task.metric_label)
-    ax.set_ylim(0.0, 1.0)
+    ax.set_ylim(*task.ylim)
     ax.set_yticks([0.0, 0.25, 0.5, 0.75, 1.0])
-    ax.set_title(task.name, loc="left")
+    ax.set_title(f"(a) {task.name}", loc="left")
     ax.grid(True, alpha=0.3)
     add_horizon_colorbar(fig, ax, cmap, norm)
     fig.suptitle("Performance vs hidden size $N$", y=1.02)
@@ -559,7 +559,7 @@ def plot_summary(
     if n_tasks == 1:
         axes = [axes]
 
-    for ax, (task_key, task) in zip(axes, TASKS.items()):
+    for i, (ax, (task_key, task)) in enumerate(zip(axes, TASKS.items())):
         summary = aggregate_scalar_results(results.get(task_key, []), GROUP_KEY)
         plot_scalar_sweep(
             ax,
@@ -568,7 +568,7 @@ def plot_summary(
             "black",
             task.metric_label,
             ylim=task.ylim,
-            title=task_panel_title(task_key, task, results),
+            title=f"({chr(ord('a') + i)}) {task_panel_title(task_key, task, results)}",
         )
         ax.set_xscale("log")
 
@@ -589,8 +589,11 @@ def plot_epoch_results(results: dict, plot_dir: Path) -> None:
         axes = [axes]
     has_data = False
 
-    for ax, (task_key, task) in zip(axes, TASKS.items()):
-        ax.set_title(task_panel_title(task_key, task, results), loc="left")
+    for i, (ax, (task_key, task)) in enumerate(zip(axes, TASKS.items())):
+        ax.set_title(
+            f"({chr(ord('a') + i)}) {task_panel_title(task_key, task, results)}",
+            loc="left",
+        )
         ax.set_ylabel(task.epoch_ylabel)
         ax.set_ylim(*task.ylim)
         ax.grid(True, alpha=0.3)
@@ -606,6 +609,7 @@ def plot_epoch_results(results: dict, plot_dir: Path) -> None:
         labels = [rf"$N={n}$" for n in ns]
         ordered = {n: curves[n] for n in ns}
 
+        legend_loc = "center right" if task_key == "smnist" else "lower right"
         plot_epoch_curves_with_stats(
             ax,
             ordered,
@@ -614,6 +618,7 @@ def plot_epoch_results(results: dict, plot_dir: Path) -> None:
             ylim=task.ylim,
             random_guess=task.random_guess,
             max_epoch=None,
+            legend_loc=legend_loc,
         )
 
     if not has_data:

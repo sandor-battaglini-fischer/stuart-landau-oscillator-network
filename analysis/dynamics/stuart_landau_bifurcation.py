@@ -325,17 +325,11 @@ def main():
     ax.set_xlabel(r"$\lambda$", fontsize=18)
     ax.set_ylabel(r"$\gamma_\mathrm{r}$", fontsize=18)
     ax.tick_params(labelsize=14)
-    ax.set_title(
-        rf"Stuart--Landau regimes in $(\lambda,\gamma_\mathrm{{r}})$"
-        + rf", $\omega={omega:.2f}$, $\gamma_i={gamma_imag:.2f}$",
-        fontsize=20,
-        pad=10,
-    )
 
     legend_handles = [
         Patch(facecolor=thesis_blue, label="Stable fixed point"),
         Patch(facecolor=ifisc_green, label="Stable limit cycle"),
-        Patch(facecolor=thesis_red, label="Divergent limit cycle"),
+        Patch(facecolor=thesis_red, label="Unstable limit cycle"),
     ]
     ax.legend(
         handles=legend_handles,
@@ -368,7 +362,7 @@ def main():
         norm=norm,
     )
     ax_a.set_xlabel(r"$\lambda$", fontsize=18)
-    ax_a.set_ylabel(r"$\gamma_\mathrm{real}$", fontsize=18)
+    ax_a.set_ylabel(r"$\gamma_\mathrm{r}$", fontsize=18)
     ax_a.tick_params(labelsize=14)
     ax_a.set_title(
         r"Stuart--Landau analytical regimes in $(\lambda,\gamma_\mathrm{r})$",

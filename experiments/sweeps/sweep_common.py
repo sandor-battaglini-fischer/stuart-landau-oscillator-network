@@ -582,6 +582,7 @@ def plot_epoch_curves_with_stats(
     max_epoch: int | None = 40,
     legend_fontsize: float = 11,
     random_guess: float | None = None,
+    legend_loc: str = "lower right",
 ) -> None:
     for idx, (group_val, stats) in enumerate(curves_by_group.items()):
         color = colors[idx % len(colors)]
@@ -611,7 +612,7 @@ def plot_epoch_curves_with_stats(
     if title:
         ax.set_title(title, loc="left")
     ax.grid(True, alpha=0.3)
-    ax.legend(loc="lower right", fontsize=legend_fontsize, ncol=2)
+    ax.legend(loc=legend_loc, fontsize=legend_fontsize, ncol=2)
     if ylim is not None:
         ax.set_ylim(*ylim)
     if max_epoch is not None:
