@@ -1,20 +1,18 @@
-import os
 import argparse
 import json
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-
-from training.train_mackey_glass import build_dataloaders
-
 import os
 import sys
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+import matplotlib.colors as mcolors
+import matplotlib.pyplot as plt
+import numpy as np
 
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
+
+from training.train_mackey_glass import build_dataloaders
 from utils.plotting_utils.style import apply_style, thesis_red, thesis_blue, ifisc_green, mycmap
+
 apply_style()
 
 
@@ -276,7 +274,6 @@ def create_horizon_predictions_comparison_plot(results_by_freqs, output_dir, con
         if full_series is None or test_start_idx is None:
             config = configs_by_freqs.get(remove_freqs, {})
             try:
-                from training.train_mackey_glass import build_dataloaders
                 _, _, test_loader, full_series, _, _ = build_dataloaders(
                     series_length=config.get('series_length', 20000),
                     input_length=config.get('input_length', 100),

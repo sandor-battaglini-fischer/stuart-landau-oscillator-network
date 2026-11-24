@@ -500,7 +500,7 @@ def plot_sentiment_comparison(
             vmin=vmin_z,
             vmax=vmax_z,
         )
-        axes3[1, 0].set_title("negative: $\Re(z)$ before readout")
+        axes3[1, 0].set_title(r"negative: $\Re(z)$ before readout")
         axes3[1, 0].set_ylabel("unit")
         axes3[1, 0].set_xlabel("time step")
         im3 = axes3[1, 1].imshow(
@@ -511,7 +511,7 @@ def plot_sentiment_comparison(
             vmin=vmin_z,
             vmax=vmax_z,
         )
-        axes3[1, 1].set_title("positive: $\Re(z)$ before readout")
+        axes3[1, 1].set_title(r"positive: $\Re(z)$ before readout")
         axes3[1, 1].set_xlabel("time step")
         fig3.colorbar(im3, ax=axes3[1, :].tolist(), shrink=0.85, label=r"$\Re(z)$")
         plt.tight_layout()

@@ -619,14 +619,6 @@ def plot_epoch_curves_with_stats(
         ax.set_xlim(0, max_epoch)
 
 
-def add_stats_legend(fig, y: float = 1.08) -> None:
-    handles = [
-        plt.Line2D([0], [0], color="gray", linewidth=2, label="mean"),
-        plt.Rectangle((0, 0), 1, 1, facecolor="gray", alpha=0.25, label="$95\\%$ CI"),
-    ]
-    fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, y), ncol=2, frameon=False)
-
-
 def load_sweep_config(sweep_dir: Path) -> dict:
     path = sweep_dir / "sweep_config.json"
     if not path.is_file():
@@ -746,3 +738,49 @@ def add_horizon_colorbar(fig, ax, cmap, norm, label: str = "Horizon"):
     cbar.set_label(label, size=label_size)
     cbar.ax.tick_params(labelsize=tick_size)
     return cbar
+
+
+def mackey_glass_horizons(results: dict) -> list[int]:
+    return sorted({
+        int(entry["horizon"])
+        for entry in results.get("mackey_glass", [])
+        if entry.get("status") == "ok" and entry.get("horizon") is not None
+    })
+
+
+def default_mackey_glass_horizon(tasks: dict) -> int | None:
+    cmd = tasks["mackey_glass"].base_cmd
+    try:
+        return int(cmd[cmd.index("--horizon") + 1])
+    except (ValueError, IndexError):
+        return None
+
+
+def task_panel_title(task_key: str, task, results: dict, tasks: dict) -> str:
+    if task_key != "mackey_glass":
+        return task.name
+    hs = mackey_glass_horizons(results)
+    h = hs[0] if len(hs) == 1 else (default_mackey_glass_horizon(tasks) if not hs else None)
+    return task.name if h is None else rf"{task.name} $H={h}$"
+
+
+def other_tasks_have_data(results: dict, tasks: dict) -> bool:
+    return any(
+        entry.get("status") == "ok"
+        for task_key in tasks if task_key != "mackey_glass"
+        for entry in results.get(task_key, [])
+    )
+
+
+def multi_task_panels(results: dict, tasks: dict, horizons: list[int] | None = None) -> list[tuple]:
+    """(task_key, task, title, entries) per plot panel, with Mackey-Glass split by horizon."""
+    panels = []
+    for task_key, task in tasks.items():
+        entries = [e for e in results.get(task_key, []) if e.get("status") == "ok"]
+        plot_hs = select_plot_horizons(mackey_glass_horizons(results), horizons) if task_key == "mackey_glass" else []
+        if not plot_hs:
+            panels.append((task_key, task, task_panel_title(task_key, task, results, tasks), entries))
+        for h in plot_hs:
+            subset = [e for e in entries if e.get("horizon") == h]
+            panels.append((task_key, task, rf"{task.name} $H={h}$", subset or entries))
+    return panels

@@ -3,10 +3,10 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-PYTHON="${ROOT}/.venv/bin/python"
+PYTHON="${PYTHON:-python}"
 OUT_DIR="${ROOT}/results/memory_capacity/ckpts/mg_sl_best"
 
-"$PYTHON" training/train_mackey_glass.py \
+$PYTHON training/train_mackey_glass.py \
   --dynamics sl \
   --num-hidden 50 \
   --alpha 0.04 \
@@ -22,7 +22,7 @@ OUT_DIR="${ROOT}/results/memory_capacity/ckpts/mg_sl_best"
   --skip-epoch-plots \
   --output-dir "$OUT_DIR"
 
-"$PYTHON" analysis/memory_capacity.py \
+$PYTHON analysis/memory_capacity.py \
   --task mackey_glass \
   --run-dir "$OUT_DIR" \
   --probes noise,task \

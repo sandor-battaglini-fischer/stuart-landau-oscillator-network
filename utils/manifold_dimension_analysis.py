@@ -777,3 +777,45 @@ def collect_and_save_final_states(data_loader, model, dynamics_type, output_dir,
         print("Warning: Could not compute PCA for animation")
 
     return states_file
+
+
+def run_final_manifold_analysis(test_loader, model, dynamics, output_dir, batch_size_test, fh_log,
+                                is_imdb=False, max_samples=10000, lightweight=False, save_states=True):
+    """End-of-training analysis: writes manifold_dimension_results.json, a log summary and the final states."""
+    import json
+    import os
+
+    from utils.model_factory import manifold_dynamics_type
+
+    dyn = manifold_dynamics_type(dynamics)
+    try:
+        result = analyze_manifold_dimension(
+            test_loader, model, dyn, output_dir, epoch=None, batch_size_test=batch_size_test,
+            max_samples=max_samples, variance_threshold=0.95, is_imdb=is_imdb, lightweight=lightweight,
+        )
+        if result is not None:
+            with open(os.path.join(output_dir, 'manifold_dimension_results.json'), 'w') as f:
+                json.dump(result, f, indent=2)
+            corr = result['correlation_dim']
+            explained = result['explained_variance_95']
+            fh_log.write(
+                '\nManifold dimension analysis\n'
+                f"PCA effective dimension (95% variance): {result['effective_dim_pca']}\n"
+                f"Participation ratio: {result['participation_ratio']}\n"
+                f"Correlation dimension: {'N/A' if corr is None else f'{corr:.4f}'}\n"
+                f"State space dimension: {result['state_dim']}\n"
+                f"Number of samples analyzed: {result['n_samples']}\n"
+                f"Explained variance at 95% threshold: {'N/A' if explained is None else f'{explained:.4f}'}\n"
+            )
+    except Exception as e:
+        fh_log.write(f'\nManifold dimension analysis failed: {e}\n')
+        print(f'Manifold dimension analysis failed: {e}')
+
+    if save_states:
+        try:
+            collect_and_save_final_states(test_loader, model, dyn, output_dir, batch_size_test=batch_size_test,
+                                          max_samples=50000, is_imdb=is_imdb)
+        except Exception as e:
+            fh_log.write(f'\nCollecting final states failed: {e}\n')
+            print(f'Collecting final states failed: {e}')
+    fh_log.flush()

@@ -1,191 +1,101 @@
 # Stuart-Landau Oscillator Network (SLON)
 
-A low-dimensional recurrent neural network built from coupled Stuart-Landau oscillators, inspired by neuromorphic photonic architectures. The model is trained end-to-end on sequence tasks while retaining a clear dynamical-systems interpretation of its internal states.
+A recurrent network of coupled Stuart-Landau oscillators, trained end to end on sequential MNIST,
+IMDb sentiment classification and Mackey-Glass forecasting. Code for the paper *TBD* (IFISC).
 
-This repository is the code companion to the paper *TBD* (IFISC). It supports training, hyperparameter search, and post-hoc analysis across three benchmark tasks: sequential MNIST, IMDb sentiment classification, and Mackey-Glass time-series prediction.
+Each hidden unit is a complex oscillator
 
-## Model
+    dz/dt = (λ + iω) z + (γ_r + iγ_i) |z|² z + α tanh(W_in x + W_rec [Re z, Im z] / √N)
 
-The core module is `SLON` (`models/stuart_landau.py`): a complex-valued oscillator network with input, recurrent, and readout layers. Each hidden unit evolves according to Stuart-Landau dynamics driven by a tanh-gated input force.
-
-
-| Symbol                     | Role                                                 |
-| -------------------------- | ---------------------------------------------------- |
-| `h`                        | Discrete time step (microscopic time constant)       |
-| `alpha`                    | Input excitability                                   |
-| `lambda_param`             | Real part of the linear coefficient (growth/damping) |
-| `omega`                    | Natural frequency                                    |
-| `gamma_real`, `gamma_imag` | Nonlinear saturation coefficients                    |
-
-
-For IMDb, a `SLONWithEmbedding` wrapper (`training/train_imdb.py`) adds a word-embedding layer in front of the oscillator core.
-
-Natural frequency is typically set from the stimulus period: `omega ≈ 2π / (sequence_length × h)`.
-
-## Tasks
-
-
-| Task             | Script                           | Input                                        | Output           |
-| ---------------- | -------------------------------- | -------------------------------------------- | ---------------- |
-| Sequential MNIST | `training/train_smnist.py`       | 784-pixel scanline (1-D time series)         | 10 digit classes |
-| IMDb sentiment   | `training/train_imdb.py`         | Token sequences (GloVe or random embeddings) | Binary sentiment |
-| Mackey-Glass     | `training/train_mackey_glass.py` | Past time-series window                      | Future value     |
-
+integrated with explicit Euler steps of size `h`. Only the input, recurrent and readout weights are
+trained; `λ, ω, γ_r, γ_i, α, h` are fixed hyperparameters. `--dynamics` selects the full model
+(`sl`), the same model without the cubic term (`lo`), or a damped harmonic oscillator with matching
+linear poles (`dho`). `--no-tanh` removes the input nonlinearity.
 
 ## Setup
 
-**Requirements:** Python 3.10+. Dependencies are listed in `requirements.txt` (PyTorch, torchvision, NumPy, SciPy, Matplotlib, pandas, tqdm, scikit-learn, imageio, pillow).
-
-Install [uv](https://docs.astral.sh/uv/) if you don't have it yet:
+Python 3.10+.
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-# or: brew install uv
-```
-
-Create a virtual environment and install dependencies:
-
-```bash
-uv venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+uv venv && source .venv/bin/activate
 uv pip install -r requirements.txt
 ```
 
-Run scripts with the activated environment:
+MNIST, IMDb and GloVe are downloaded into `data/` on first use. Mackey-Glass is generated. Run
+everything from the repository root; outputs go to `results/`.
+
+## Training
 
 ```bash
-python training/train_smnist.py --epochs 50 --num-hidden 50
-```
-
-Or without activating the venv:
-
-```bash
-uv run --with-requirements requirements.txt python training/train_smnist.py --epochs 50 --num-hidden 50
-```
-
-**Data** (stored under `data/`, gitignored):
-
-- **MNIST** — downloaded automatically on first run (or place under `data/MNIST/`).
-- **IMDb** — downloaded automatically from Stanford ACL archive; GloVe embeddings fetched on demand into `data/glove/`.
-- **Mackey-Glass** — generated synthetically inside the training script.
-
-Run all commands from the repository root so that `models/` and `utils/` resolve correctly.
-
-## Quick start
-
-```bash
-# Sequential MNIST
-python training/train_smnist.py --epochs 50 --num-hidden 50
-
-# IMDb sentiment
+python training/train_smnist.py --epochs 50 --num-hidden 50 --lambda-param -0.04
 python training/train_imdb.py --epochs 20 --num-hidden 50
-
-# Mackey-Glass prediction
-python training/train_mackey_glass.py --epochs 100 --num-hidden 50
+python training/train_mackey_glass.py --epochs 100 --num-hidden 50 --horizon 25 --input-length 100
+python training/train_smnist_pixel_values.py --epochs 20     # reconstruct the whole image from the final state
 ```
 
-Each training script accepts hyperparameters for dynamics (`--h`, `--alpha`, `--omega`, `--lambda-param`, `--gamma-real`, `--gamma-imag`) and supports single-parameter sweeps (e.g. `--sweep-omega`). Use `--help` on any script for the full option list.
+Each run writes `log.txt`, `metrics.json`, checkpoints and per-epoch figures (state space, PCA and
+correlation dimension, Lyapunov exponents) to `results/<task>/<timestamp>/`. `--sweep-mode` keeps only
+`log.txt` and `metrics.json`; `--output-dir` fixes the run directory. See `--help` for all options.
 
-**Dynamics demo** — visualise oscillator responses to a sinusoidal pulse:
+## Experiments
 
-```bash
-python examples/slon_dynamics_demo.py
+| Script | What it runs |
+| --- | --- |
+| `experiments/grid_search/lga_grid.py local` | λ × γ_r × γ_i × α grid with several seeds, plus heatmaps |
+| `experiments/sweeps/scaling_sweep.py` | hidden size N |
+| `experiments/sweeps/nonlinearity_ablation_sweep.py` | `sl` / `lo` / `dho`, with and without tanh |
+| `experiments/sweeps/param_sweep.py --param {omega,alpha}` | natural frequency or input gain |
+| `experiments/mg_comparison.py` | Mackey-Glass over horizons, τ and removed Fourier modes |
+
+The sweeps call the training scripts, keep their results in `--sweep-dir`, resume with
+`--skip-existing` and redraw figures with `--plot-only`. `lga_grid.py` resumes from its `--run-dir`
+and redraws with `lga_grid.py aggregate`. `scripts/` has Slurm wrappers for the grid and the ablation.
+
+## Analysis
+
+| Script | Input |
+| --- | --- |
+| `analysis/readout_state_analysis.py` | a trained run: node trajectories, final state, t-SNE, decision boundary |
+| `analysis/memory_capacity.py` | a trained run or a fresh model: Jaeger memory capacity |
+| `analysis/autonomous_dynamics.py` | a trained run or a fresh model: driven vs input-free dynamics |
+| `analysis/input_signal_analysis.py` | pre-nonlinearity input statistics per task |
+| `analysis/network_utilisation.py` | full runs per task and a scaling sweep: dimension and weight usage |
+| `analysis/mg_horizon_comparison.py` | `mg_comparison.py` output |
+| `analysis/dynamics/` | bifurcation and regime diagrams of a single oscillator |
+| `scripts/plot_parameters_retrospective.py` | a trained run: redraw the weight and parameter plots |
+
+`scripts/mc_pipeline_*.sh` train a model and compute its memory capacity in one go.
+
+## Reproducing the figures
+
+Settings follow Tables IV and V of the paper. Grid and sweep scripts write their figures into their run directory.
+
+| Figure | Command |
+| --- | --- |
+| 1 | `python analysis/dynamics/stuart_landau_bifurcation.py --analytic-only` |
+| 3 | `python analysis/input_signal_analysis.py compare` and `... mg` |
+| 4 | `PRESET=regime ./scripts/submit_lga_grid.sh`, then `lga_grid.py summary --run-dirs results/grid_search/regime_*` |
+| 5 | `python experiments/sweeps/scaling_sweep.py --epochs 40 --horizons 1 25` |
+| 6 | `python experiments/sweeps/nonlinearity_ablation_sweep.py --epochs 200 --horizons 1 25` |
+| S8, S9 | the same two sweeps with `--tasks mackey_glass --horizons 1 5 10 15 20 25 30 40 50` |
+| 7, 9, 10 | `python analysis/readout_state_analysis.py --task {imdb,smnist,mackey_glass} --run-dir <run>` |
+| 8 | `python analysis/dynamics/analytical_stuart_landau_regimes.py` |
+| S1 | `python experiments/sweeps/param_sweep.py --param omega` |
+| S2–S5 | `PRESET=alpha ./scripts/submit_lga_grid.sh`, then `lga_grid.py summary --run-dirs results/grid_search/alpha_*` |
+| S6 | `sbatch scripts/weight_variance_runs.sbatch`, then `analysis/network_utilisation.py --variance-runs ...` |
+| S7 | `python training/train_smnist_pixel_values.py` |
+| S7 (frozen embeddings) | `python training/train_imdb.py --num-hidden 9 --lambda-param -0.08 --gamma-imag 0.08 --early-stop-patience 10 --freeze-embedding` |
+
+## Layout
+
 ```
-
-## Training outputs
-
-Runs are saved under `results/<task>/<timestamp>/` (gitignored). A typical run directory contains:
-
+models/       SLON (Stuart-Landau) and HORN (damped harmonic oscillator)
+training/     one script per task
+experiments/  grid search and sweeps built on the training scripts
+analysis/     figures from trained runs or from the oscillator equations
+utils/        model factory, run directories, manifold analysis, plotting
+examples/     response of a small untrained network to a sine pulse
 ```
-results/smnist/20260619_160133/
-├── log.txt                          # epoch-by-epoch metrics
-├── metrics.json                     # structured training history
-├── parameters.json                  # per-epoch weight and dynamics snapshots
-├── best_model.pt / last_model.pt    # model checkpoints
-├── loss_and_accuracy_over_time.png
-├── parameter_evolution_*.png        # weight and dynamics trajectories
-├── weight_heatmap_*.png
-└── epochs/
-    └── epoch00/
-        ├── state_space_2d_epoch00.png
-        ├── correlation_dimension_epoch00.png
-        ├── pca_analysis_epoch00.png
-        └── ...
-```
-
-Manifold-dimension analysis (PCA, correlation dimension, Lyapunov exponents) runs every 10 epochs and at the end of training when `--analyze-manifold` is enabled (default).
-
-Regenerate parameter plots from a saved run:
-
-```bash
-python scripts/plot_parameters_retrospective.py results/smnist/20260619_160133/
-```
-
-## Repository structure
-
-```
-stuart-landau-oscillator-network/
-├── models/
-│   └── stuart_landau.py             # SLON core module
-├── training/
-│   ├── train_smnist.py              # Sequential MNIST
-│   ├── train_imdb.py                # IMDb (+ SLONWithEmbedding)
-│   └── train_mackey_glass.py        # Mackey-Glass regression
-├── utils/
-│   ├── run_dirs.py                  # Timestamped run directories, checkpoints
-│   ├── slon_analysis.py             # Parameter extraction and statistics
-│   ├── manifold_dimension_analysis.py  # State-space / dimension analysis
-│   ├── paths.py                     # Project root helper
-│   └── plotting_utils/              # Shared plotting (classification, regression, GIFs)
-├── experiments/                     # Larger-scale studies
-│   ├── grid_search/                 # Grid search over dynamics parameters
-│   │   ├── smnist.py
-│   │   ├── imdb.py
-│   │   └── mackey_glass.py
-│   ├── sweeps/                      # Cross-task parameter sweeps
-│   │   ├── omega_sweep.py
-│   │   └── alpha_sweep.py
-│   ├── mackey_glass/
-│   │   └── comparison.py            # Multi-configuration Mackey-Glass runs
-│   └── multi_task/
-│       └── scaling.py               # Hidden-size scaling across all tasks
-├── analysis/                        # Post-training figure generation
-│   ├── smnist/                      # Log and sweep analysis
-│   ├── imdb/
-│   ├── mackey_glass/                # Horizon comparison, interactive explorer
-│   ├── dynamics/                    # Bifurcation diagrams, memory kernel, regimes
-│   ├── multi_task/                  # Cross-task heatmaps, ablations, scaling plots
-│   └── input_signal_analysis.py     # Pre-nonlinearity input statistics
-├── examples/
-│   └── slon_dynamics_demo.py        # Single-unit dynamics visualisation
-├── scripts/
-│   └── plot_parameters_retrospective.py
-├── scripts-to-incorporate/          # Legacy scripts (superseded by analysis/ and experiments/)
-├── data/                            # Datasets and caches (gitignored)
-└── results/                         # Training and experiment outputs (gitignored)
-```
-
-### `experiments/` vs `analysis/`
-
-- `**experiments/**` — launch training runs or sweeps (often calling into `training/` scripts via subprocess). Use these for systematic hyperparameter search and scaling studies.
-- `**analysis/**` — read existing `results/` or pre-computed JSON logs and produce publication figures. Most scripts have their own CLI; run with `--help` where available.
-
-Notable analysis entry points:
-
-
-| Script                                           | Purpose                                  |
-| ------------------------------------------------ | ---------------------------------------- |
-| `analysis/smnist/log_analysis.py`                | Parse and plot sMNIST training logs      |
-| `analysis/imdb/sweep_analysis.py`                | Visualise IMDb omega/lambda sweeps       |
-| `analysis/mackey_glass/horizon_comparison.py`    | Compare prediction horizons              |
-| `analysis/mackey_glass/interactive.py`           | Interactive Mackey-Glass explorer        |
-| `analysis/multi_task/heatmaps.py`                | Cross-task performance heatmaps          |
-| `analysis/multi_task/ablation_curves.py`         | Ablation study curves                    |
-| `analysis/multi_task/network_utilisation.py`     | Hidden-unit utilisation comparison       |
-| `analysis/dynamics/stuart_landau_bifurcation.py` | Bifurcation analysis                     |
-| `analysis/dynamics/memory_kernel.py`             | Memory-kernel characterisation           |
-| `analysis/input_signal_analysis.py`              | Input statistics before the nonlinearity |
-
 
 ## Citation
 
@@ -197,4 +107,3 @@ Notable analysis entry points:
   year    = {2026}
 }
 ```
-

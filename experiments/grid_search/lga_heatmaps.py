@@ -300,6 +300,17 @@ def _draw_zero_parameter_lines(ax, x_vals, y_vals, color="white", linewidth=2.5)
         ax.axhline(0.0, color=color, linewidth=linewidth, alpha=0.95)
 
 
+def discrete_hopf_lambda(omega: float, h: float = 1.0) -> float:
+    """Hopf boundary of the Euler-discretised node: |1 + h(lambda + i omega)| = 1."""
+    return (-1.0 + np.sqrt(max(0.0, 1.0 - (h * omega) ** 2))) / h
+
+
+def _draw_discrete_hopf_line(ax, lambda_vals, omega, linewidth=2.5):
+    lam_c = discrete_hopf_lambda(omega)
+    if min(lambda_vals) <= lam_c <= max(lambda_vals):
+        ax.axvline(lam_c, color=thesis_red, linestyle=":", linewidth=linewidth)
+
+
 def _heatmap_xlabel_pad(param1_name: str) -> float:
     if param1_name == "lambda":
         return HEATMAP_XLABEL_PAD_LAMBDA
@@ -354,6 +365,7 @@ def _save_summary_heatmap(
     scale: float,
     metric_label: str,
     title_suffix: str = "",
+    omega: float | None = None,
 ) -> None:
     missing_mask = np.isnan(heatmap_avg)
     valid_data = heatmap_avg[~missing_mask]
@@ -375,6 +387,8 @@ def _save_summary_heatmap(
 
     _set_summary_ticks(ax, param1_vals, param2_vals, param1_name, param2_name)
     _draw_zero_parameter_lines(ax, param1_vals, param2_vals)
+    if omega is not None and param1_name == "lambda":
+        _draw_discrete_hopf_line(ax, param1_vals, omega)
 
     ax.set_xlabel(
         _param_label_tex(param1_name),
@@ -420,6 +434,7 @@ def generate_lga_heatmaps(
     clip_nonpositive: bool = False,
     annotate: bool = True,
     task_name: str | None = None,
+    omega: float | None = None,
 ) -> list[Path]:
     """Write progressive heatmaps; missing cells stay blank/white.
 
@@ -524,6 +539,7 @@ def generate_lga_heatmaps(
                         scale=scale,
                         metric_label=metric_label,
                         title_suffix=tex_title,
+                        omega=omega,
                     )
                     written.append(output_path)
                     return

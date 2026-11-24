@@ -18,6 +18,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
@@ -27,9 +28,13 @@ from experiments.sweeps.sweep_common import (
     aggregate_epoch_curves,
     aggregate_scalar_results,
     cmd_with_overrides,
+    default_mackey_glass_horizon,
     horizon_color_scale,
     load_results,
     load_sweep_config,
+    mackey_glass_horizons,
+    multi_task_panels,
+    other_tasks_have_data,
     observed_horizons,
     plot_epoch_curves_with_stats,
     resolve_plot_horizons,
@@ -42,6 +47,7 @@ from experiments.sweeps.sweep_common import (
     save_csv,
     save_results,
     save_summary,
+    task_panel_title,
 )
 from utils.plotting_utils.style import thesis_red, thesis_blue, ifisc_green
 
@@ -796,7 +802,7 @@ def report_ablation_progress(
             if len(named) == 1:
                 prefix = f"{prefix}H={named[0]} "
             elif not named:
-                h = default_mackey_glass_horizon()
+                h = default_mackey_glass_horizon(TASKS)
                 if h is not None:
                     prefix = f"{prefix}H={h} "
         for v in ordered:
@@ -914,7 +920,7 @@ def update_live_plots(
         sweep_dir / "nonlinearity_ablation_performance.png",
         horizons=horizons,
     )
-    if mackey_glass_horizons(results) and not other_tasks_have_data(results):
+    if mackey_glass_horizons(results) and not other_tasks_have_data(results, TASKS):
         return
     plot_epoch_results(
         results, sweep_dir, max_epoch=max_epoch, horizons=horizons
@@ -924,80 +930,6 @@ def update_live_plots(
 def ablation_colors_for(variant_keys: list[str]) -> list:
     variant_order = list(VARIANTS.keys())
     return [ABLATION_COLORS[variant_order.index(k)] for k in variant_keys]
-
-
-def mackey_glass_horizons(results: dict) -> list[int]:
-    horizons = {
-        int(entry[HORIZON_KEY])
-        for entry in results.get("mackey_glass", [])
-        if entry.get("status") == "ok" and entry.get(HORIZON_KEY) is not None
-    }
-    return sorted(horizons)
-
-
-def default_mackey_glass_horizon() -> int | None:
-    cmd = TASKS["mackey_glass"].base_cmd
-    try:
-        return int(cmd[cmd.index("--horizon") + 1])
-    except (ValueError, IndexError):
-        return None
-
-
-def mackey_glass_display_horizon(results: dict) -> int | None:
-    hs = mackey_glass_horizons(results)
-    if len(hs) == 1:
-        return hs[0]
-    if not hs:
-        return default_mackey_glass_horizon()
-    return None
-
-
-def task_panel_title(task_key: str, task: TaskConfig, results: dict) -> str:
-    if task_key != "mackey_glass":
-        return task.name
-    h = mackey_glass_display_horizon(results)
-    if h is None:
-        return task.name
-    return rf"{task.name} $H={h}$"
-
-
-def other_tasks_have_data(results: dict) -> bool:
-    for task_key in TASKS:
-        if task_key == "mackey_glass":
-            continue
-        if any(entry.get("status") == "ok" for entry in results.get(task_key, [])):
-            return True
-    return False
-
-
-def iter_multi_task_panels(
-    results: dict, horizons: list[int] | None = None
-) -> list[tuple[str, TaskConfig, str, list[dict]]]:
-    """Build plot panels: one per task, with Mackey-Glass split by horizon when needed."""
-    panels: list[tuple[str, TaskConfig, str, list[dict]]] = []
-    for task_key, task in TASKS.items():
-        entries = [e for e in results.get(task_key, []) if e.get("status") == "ok"]
-        if task_key != "mackey_glass":
-            panels.append((task_key, task, task.name, entries))
-            continue
-
-        present = mackey_glass_horizons(results)
-        plot_hs = select_plot_horizons(present, horizons)
-        if len(plot_hs) >= 2:
-            for h in plot_hs:
-                subset = [e for e in entries if e.get(HORIZON_KEY) == h]
-                panels.append((task_key, task, rf"{task.name} $H={h}$", subset))
-        elif len(plot_hs) == 1:
-            h = plot_hs[0]
-            subset = [e for e in entries if e.get(HORIZON_KEY) == h]
-            panels.append(
-                (task_key, task, rf"{task.name} $H={h}$", subset if subset else entries)
-            )
-        else:
-            panels.append(
-                (task_key, task, task_panel_title(task_key, task, results), entries)
-            )
-    return panels
 
 
 def plot_horizon_ablation_performance(
@@ -1073,11 +1005,11 @@ def plot_summary(
     results: dict, plot_path: Path, horizons: list[int] | None = None
 ) -> None:
     results = results_for_plotting(results)
-    if mackey_glass_horizons(results) and not other_tasks_have_data(results):
+    if mackey_glass_horizons(results) and not other_tasks_have_data(results, TASKS):
         plot_horizon_ablation_performance(results, plot_path, horizons=horizons)
         return
 
-    panels = iter_multi_task_panels(results, horizons=horizons)
+    panels = multi_task_panels(results, TASKS, horizons=horizons)
     n_panels = len(panels)
     fig, axes = plt.subplots(n_panels, 1, figsize=(7, 3.2 * n_panels), sharex=True)
     if n_panels == 1:
@@ -1113,6 +1045,29 @@ def plot_summary(
     print(f"Saved plot: {plot_path}")
 
 
+def add_zoom_inset(ax, curves: dict, colors: list, tail_fraction: float = 0.2) -> None:
+    """Inset over the last epochs, where the variants are too close to tell apart at full scale."""
+    n_epochs = max(len(stats["mean"]) for stats in curves.values())
+    start = int(n_epochs * (1 - tail_fraction))
+    if n_epochs - start < 2:
+        return
+    # lower right; the IMDb legend goes to the lower left
+    inset = ax.inset_axes([0.67, 0.1, 0.3, 0.38], zorder=5)
+    inset.set_facecolor("white")
+    lo, hi = np.inf, -np.inf
+    for (label, stats), color in zip(curves.items(), colors):
+        epochs, mean, ci = stats["epochs"][start:], stats["mean"][start:], stats["ci95"][start:]
+        inset.plot(epochs, mean, color=color, linewidth=1.2)
+        inset.fill_between(epochs, mean - ci, mean + ci, color=color, alpha=0.2, linewidth=0)
+        lo, hi = min(lo, np.nanmin(mean - ci)), max(hi, np.nanmax(mean + ci))
+    if np.isfinite(lo) and np.isfinite(hi):
+        pad = 0.1 * max(hi - lo, 1e-3)
+        inset.set_ylim(lo - pad, hi + pad)
+    inset.set_xlim(start, n_epochs - 1)
+    inset.tick_params(labelsize=8)
+    inset.grid(True, alpha=0.3)
+
+
 def plot_epoch_results(
     results: dict,
     plot_dir: Path,
@@ -1121,7 +1076,7 @@ def plot_epoch_results(
 ) -> None:
     results = results_for_plotting(results)
     plot_dir.mkdir(parents=True, exist_ok=True)
-    panels = iter_multi_task_panels(results, horizons=horizons)
+    panels = multi_task_panels(results, TASKS, horizons=horizons)
     n_panels = len(panels)
     fig, axes = plt.subplots(n_panels, 1, figsize=(7, 3.2 * n_panels), sharex=True)
     if n_panels == 1:
@@ -1152,7 +1107,10 @@ def plot_epoch_results(
             ylim=task.ylim,
             random_guess=task.random_guess,
             max_epoch=max_epoch,
+            legend_loc="lower left" if _task_key == "imdb" else "lower right",
         )
+        if _task_key == "imdb":
+            add_zoom_inset(ax, ordered, colors)
 
     if not has_data:
         plt.close(fig)

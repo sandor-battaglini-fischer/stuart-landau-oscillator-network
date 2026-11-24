@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
-"""Parallel lambda / gamma_real / alpha (/ seed) grid search.
+"""Parallel lambda / gamma_real / alpha / seed grid search.
 
-Primary entry for the cluster `run` wrapper (shared 32-core node):
-
-  run -t 100:00 -c 32 -m 32 -j lga-grid -o lga-grid.out -e lga-grid.err -- \\
-    .venv/bin/python experiments/grid_search/lga_grid.py local \\
-      --tasks imdb smnist mackey_glass \\
+  python experiments/grid_search/lga_grid.py local --tasks imdb smnist mackey_glass \\
       --workers 32 --run-dir results/grid_search/lga_main
 
-Resume the same run later with the same --run-dir (completed jobs are skipped).
+Rerunning with the same --run-dir skips finished jobs.
 """
 
 from __future__ import annotations
@@ -118,7 +114,7 @@ TASKS: dict[str, TaskConfig] = {
         scale=1.0,
         omega=0.224,
         gamma_imag=0.0,
-        base_cmd=_task_base("training/train_smnist.py", ["--lr", "1e-2"]),
+        base_cmd=_task_base("training/train_smnist.py", ["--lr", "1e-2", "--shuffle"]),
     ),
     "mackey_glass": TaskConfig(
         name="Mackey-Glass",
@@ -184,26 +180,51 @@ def build_combinations(
     gamma_real_vals: list[float],
     alpha_vals: list[float],
     seeds: list[int],
+    gamma_imag_vals: list[float] | None = None,
 ) -> list[dict]:
     combos = []
-    idx = 0
     for task in tasks:
+        gi_vals = gamma_imag_vals or [TASKS[task].gamma_imag]
         for lam in lambda_vals:
             for gr in gamma_real_vals:
-                for alpha in alpha_vals:
-                    for seed in seeds:
-                        combos.append(
-                            {
-                                "index": idx,
+                for gi in gi_vals:
+                    for alpha in alpha_vals:
+                        for seed in seeds:
+                            combos.append({
+                                "index": len(combos),
                                 "task": task,
                                 "lambda": float(lam),
                                 "gamma_real": float(gr),
+                                "gamma_imag": float(gi),
                                 "alpha": float(alpha),
                                 "seed": int(seed),
-                            }
-                        )
-                        idx += 1
+                            })
     return combos
+
+
+def set_flag(cmd: list[str], flag: str, value) -> list[str]:
+    """Return cmd with `flag value` replaced, or appended if absent."""
+    cmd = list(cmd)
+    if flag in cmd:
+        cmd[cmd.index(flag) + 1] = str(value)
+    else:
+        cmd += [flag, str(value)]
+    return cmd
+
+
+def task_base_cmds(args: argparse.Namespace) -> dict[str, list[str]]:
+    """Base command per task (without the interpreter), stored in config.json at creation."""
+    cmds = {}
+    for task in args.tasks:
+        cmd = list(TASKS[task].base_cmd[1:])
+        if task == "smnist" and not args.permuted_smnist:
+            cmd = [c for c in cmd if c != "--shuffle"]
+        if task == "mackey_glass":
+            cmd = set_flag(cmd, "--horizon", args.mg_horizon)
+            cmd = set_flag(cmd, "--mg-tau", args.mg_tau)
+            cmd = set_flag(cmd, "--input-length", args.mg_input_length)
+        cmds[task] = cmd
+    return cmds
 
 
 def atomic_write_json(path: Path, payload: dict) -> None:
@@ -383,7 +404,7 @@ def save_aggregated(run_dir: Path, by_task: dict[str, list[dict]], config: dict)
                 **config.get("grid", {}),
                 "task": task,
                 "omega": TASKS[task].omega,
-                "gamma_imag": TASKS[task].gamma_imag,
+                "gamma_imag": config.get("grid", {}).get("gamma_imag_values") or TASKS[task].gamma_imag,
                 "fixed_params": config.get("fixed_params", {}).get(task, {}),
                 "num_hidden": config.get("num_hidden", DEFAULT_NUM_HIDDEN),
                 "epochs": config.get("epochs", DEFAULT_EPOCHS),
@@ -404,6 +425,7 @@ def save_aggregated(run_dir: Path, by_task: dict[str, list[dict]], config: dict)
         "task",
         "lambda",
         "gamma_real",
+        "gamma_imag",
         "alpha",
         "seed",
         "metric",
@@ -485,6 +507,7 @@ def update_heatmaps(
                 clip_nonpositive=task_key in clip_tasks,
                 annotate=annotate,
                 task_name=task_key,
+                omega=task.omega,
             )
 
 
@@ -528,15 +551,18 @@ def run_worker(run_dir: str | Path, index: int, dry_run: bool = False, aggregate
     num_hidden = int(config.get("num_hidden", DEFAULT_NUM_HIDDEN))
     epochs = int(config.get("epochs", DEFAULT_EPOCHS))
     patience = int(config.get("early_stop_patience", DEFAULT_PATIENCE))
+    gamma_imag = float(combo.get("gamma_imag", task.gamma_imag))
+    # run dirs created before base_cmds was stored fall back to the current task defaults
+    base_cmd = [PYTHON, *config["base_cmds"][task_key]] if "base_cmds" in config else task.base_cmd
 
     cmd = cmd_with_params(
-        task.base_cmd,
+        base_cmd,
         seed=seed,
         omega=task.omega,
         alpha=float(combo["alpha"]),
         lambda_param=float(combo["lambda"]),
         gamma_real=float(combo["gamma_real"]),
-        gamma_imag=task.gamma_imag,
+        gamma_imag=gamma_imag,
         num_hidden=num_hidden,
         epochs=epochs,
         patience=patience,
@@ -549,7 +575,7 @@ def run_worker(run_dir: str | Path, index: int, dry_run: bool = False, aggregate
         "gamma_real": float(combo["gamma_real"]),
         "alpha": float(combo["alpha"]),
         "omega": task.omega,
-        "gamma_imag": task.gamma_imag,
+        "gamma_imag": gamma_imag,
         "seed": seed,
         "num_hidden": num_hidden,
         "epochs": epochs,
@@ -570,7 +596,7 @@ def run_worker(run_dir: str | Path, index: int, dry_run: bool = False, aggregate
 
     print(
         f"[{index}] {task.name} | λ={combo['lambda']:.4f} "
-        f"γr={combo['gamma_real']:.4f} α={combo['alpha']:.4f} seed={seed}",
+        f"γr={combo['gamma_real']:.4f} γi={gamma_imag:.4f} α={combo['alpha']:.4f} seed={seed}",
         flush=True,
     )
     env = os.environ.copy()
@@ -663,7 +689,7 @@ def _worker_entry(args: tuple[str, int]) -> dict:
     return run_worker(run_dir, index, dry_run=False, aggregate=True)
 
 
-def resolve_grid(args: argparse.Namespace) -> tuple[list[float], list[float], list[float], list[int]]:
+def resolve_grid(args: argparse.Namespace) -> tuple:
     if getattr(args, "lambda_step", None) is not None:
         lambda_vals = arange_inclusive(args.lambda_min, args.lambda_max, args.lambda_step)
     else:
@@ -703,7 +729,8 @@ def resolve_grid(args: argparse.Namespace) -> tuple[list[float], list[float], li
         seeds = [int(s) for s in args.seeds]
     else:
         seeds = list(range(1, args.num_seeds + 1))
-    return lambda_vals, gamma_real_vals, alpha_vals, seeds
+    gamma_imag_vals = [float(v) for v in args.gamma_imag_values] if args.gamma_imag_values else None
+    return lambda_vals, gamma_real_vals, alpha_vals, seeds, gamma_imag_vals
 
 
 def _resolve_heatmap_dir(args: argparse.Namespace) -> str | None:
@@ -739,8 +766,8 @@ def create_or_load_run_dir(args: argparse.Namespace) -> Path:
     (run_dir / "logs").mkdir(exist_ok=True)
     (run_dir / "heatmaps").mkdir(exist_ok=True)
 
-    lambda_vals, gamma_real_vals, alpha_vals, seeds = resolve_grid(args)
-    combinations = build_combinations(args.tasks, lambda_vals, gamma_real_vals, alpha_vals, seeds)
+    lambda_vals, gamma_real_vals, alpha_vals, seeds, gamma_imag_vals = resolve_grid(args)
+    combinations = build_combinations(args.tasks, lambda_vals, gamma_real_vals, alpha_vals, seeds, gamma_imag_vals)
 
     config = {
         "created": datetime.now().strftime("%Y%m%d_%H%M%S"),
@@ -758,12 +785,14 @@ def create_or_load_run_dir(args: argparse.Namespace) -> Path:
             "gamma_real_step": args.gamma_real_step,
             "lambda_values": lambda_vals,
             "gamma_real_values": gamma_real_vals,
+            "gamma_imag_values": gamma_imag_vals,
             "alpha_values": alpha_vals,
         },
         "fixed_params": {
             task: {"omega": TASKS[task].omega, "gamma_imag": TASKS[task].gamma_imag}
             for task in args.tasks
         },
+        "base_cmds": task_base_cmds(args),
         "combinations": combinations,
         "n_combinations": len(combinations),
         "workers": getattr(args, "workers", None),
@@ -778,6 +807,7 @@ def create_or_load_run_dir(args: argparse.Namespace) -> Path:
     print(
         f"  λ: {len(lambda_vals)} values {lambda_vals[0]} .. {lambda_vals[-1]}\n"
         f"  γr: {len(gamma_real_vals)} values {gamma_real_vals[0]} .. {gamma_real_vals[-1]}\n"
+        f"  γi: {gamma_imag_vals or 'task default'}\n"
         f"  α: {alpha_vals}\n"
         f"  seeds: {seeds}\n"
         f"  n={args.num_hidden}, epochs={args.epochs}, patience={args.early_stop_patience}",
@@ -869,9 +899,9 @@ def cmd_summary(args: argparse.Namespace) -> None:
     """Regenerate clean summary heatmaps (no cell text; MG negatives -> grey)."""
     run_dirs = [Path(p) for p in args.run_dirs]
     run_dirs = [p if p.is_absolute() else REPO_ROOT / p for p in run_dirs]
-    out_root = REPO_ROOT / "results" / "grid_search" / "summary"
-    out_root.mkdir(parents=True, exist_ok=True)
     for run_dir in run_dirs:
+        out_root = REPO_ROOT / "results" / "grid_search" / "summary" / run_dir.name
+        out_root.mkdir(parents=True, exist_ok=True)
         config = load_json(run_dir / "config.json")
         by_task = collect_results(run_dir)
         for task_key, rows in by_task.items():
@@ -949,6 +979,12 @@ def add_grid_args(parser: argparse.ArgumentParser) -> None:
         default=[0.04, 0.5, 1.0, 5.0],
         help="explicit alpha list (default: 0.04 0.5 1 5)",
     )
+    parser.add_argument("--gamma-imag-values", nargs="+", type=float, default=None,
+                        help="gamma_imag grid axis, averaged over in the heatmaps (default: fixed per task)")
+    parser.add_argument("--mg-horizon", type=int, default=25)
+    parser.add_argument("--mg-tau", type=float, default=34.0)
+    parser.add_argument("--mg-input-length", type=int, default=100)
+    parser.add_argument("--permuted-smnist", action="store_true", help="fixed random pixel permutation (psMNIST)")
     parser.add_argument("--num-seeds", type=int, default=5, help="seeds 1..N (default: 5)")
     parser.add_argument("--seeds", nargs="+", type=int, default=None, help="explicit seed list")
     parser.add_argument("--num-hidden", type=int, default=DEFAULT_NUM_HIDDEN)
@@ -969,7 +1005,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Lambda / gamma_real / alpha grid search")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_local = sub.add_parser("local", help="Run grid locally with N parallel workers (for `run -c 32`)")
+    p_local = sub.add_parser("local", help="Run the grid with N parallel workers")
     add_grid_args(p_local)
 
     p_worker = sub.add_parser("worker", help="Run one grid combination")
@@ -982,7 +1018,7 @@ def main() -> None:
 
     p_sum = sub.add_parser(
         "summary",
-        help="Write clean heatmaps under results/grid_search/summary/<task>/ (MG clipped, no cell text)",
+        help="Write clean heatmaps under results/grid_search/summary/<run-dir>/<task>/",
     )
     p_sum.add_argument(
         "--run-dirs",

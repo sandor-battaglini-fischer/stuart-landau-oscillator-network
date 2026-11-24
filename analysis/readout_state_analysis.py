@@ -1,10 +1,4 @@
-"""Granular readout-state analysis for IMDB, sMNIST, and Mackey-Glass.
-
-Rolls a trained (or init) oscillator, records every node's z(t), and plots:
-  - per-node time series with class-wise mean ± std
-  - the exact last-timestep vector that h2o receives
-  - t-SNE (1-D and 2-D) of that vector
-  - the trained linear decision scores
+"""Per-node trajectories, the final state seen by h2o, its t-SNE/PCA embedding and the linear decision.
 
 Examples:
   python analysis/readout_state_analysis.py --task smnist --run-dir results/smnist/<run>

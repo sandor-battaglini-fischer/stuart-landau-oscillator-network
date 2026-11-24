@@ -1,9 +1,4 @@
-"""Jaeger-style short-term memory capacity for frozen oscillator RNNs.
-
-Drives a frozen network with a probe sequence, then measures how well past
-univariate targets can be linearly reconstructed from the hidden state via a
-fresh ridge readout (independent of the task head ``h2o``).
-"""
+"""Jaeger short-term memory capacity of a frozen network, using a fresh ridge readout (not h2o)."""
 
 from __future__ import annotations
 
@@ -32,13 +27,7 @@ def record_states(
     inputs: torch.Tensor,
     random_init: float | None = None,
 ) -> np.ndarray:
-    """Run ``core`` with ``record=True``.
-
-    Args:
-        inputs: ``(T, B, F)`` float tensor.
-    Returns:
-        states: ``(T, B, D)`` float64 array with ``D = 2 * num_nodes``.
-    """
+    """(T, B, F) inputs -> (T, B, 2N) float64 hidden states."""
     core.eval()
     with torch.no_grad():
         out = core(inputs, random_init=random_init, record=True)
@@ -62,12 +51,7 @@ def make_noise_drive(
     noise_std: float = 1.0,
     seed: int = 0,
 ) -> tuple[torch.Tensor, np.ndarray]:
-    """Univariate i.i.d. Gaussian probe, embedded along a fixed random direction.
-
-    Returns:
-        inputs: ``(T, B, F)`` drive for the oscillator core.
-        target: ``(T, B)`` scalar signal to reconstruct (the univariate source).
-    """
+    """i.i.d. Gaussian scalar probe projected onto a fixed random input direction; returns (inputs, target)."""
     rng = np.random.default_rng(seed)
     target = rng.normal(0.0, noise_std, size=(num_steps, batch_size)).astype(np.float64)
     direction = rng.normal(0.0, 1.0, size=(num_input,)).astype(np.float64)
@@ -136,17 +120,8 @@ def memory_capacity_spectrum(
     train_fraction: float = 0.7,
     seed: int = 0,
 ) -> dict:
-    """Compute Jaeger MC_k for each delay.
-
-    Args:
-        states: ``(T, B, D)`` hidden states.
-        target: ``(T, B)`` univariate signal.
-        delays: positive integers (typically ``1..K``).
-
-    Returns:
-        dict with ``delays``, ``mc_k``, ``mc_total``, and fit metadata.
-    """
-    del seed  # reserved for optional randomized splits
+    """MC_k for each delay from (T, B, D) states and a (T, B) target."""
+    del seed
     if states.ndim != 3:
         raise ValueError(f"states must be (T, B, D), got {states.shape}")
     if target.shape != states.shape[:2]:
@@ -214,12 +189,7 @@ def drive_memory_capacity(
     seed: int = 0,
     chunk_size: int | None = None,
 ) -> dict:
-    """Record states under ``inputs`` and compute the MC spectrum.
-
-    For long sequences, ``chunk_size`` splits the time axis into contiguous
-    blocks that are driven independently (each with its own washout). Results
-    are pooled before the ridge fit.
-    """
+    """MC spectrum under `inputs`. With chunk_size, time is split into blocks driven separately and pooled."""
     delays = list(range(1, max_delay + 1))
     t_len = inputs.shape[0]
 

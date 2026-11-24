@@ -1,5 +1,6 @@
 import os
 
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -307,16 +308,6 @@ def _fit_tsne(features, n_components, seed, perplexity=30):
         return reducer.fit_transform(features)
     except Exception:
         return None
-
-
-def _fit_pca(features, n_components):
-    from sklearn.decomposition import PCA
-
-    n = min(n_components, features.shape[0], features.shape[1])
-    if n < 1:
-        return None, None
-    pca = PCA(n_components=n, random_state=0)
-    return pca.fit_transform(features), pca.explained_variance_ratio_
 
 
 def _mg_abs_error(logits, targets):
@@ -672,39 +663,38 @@ def plot_tsne_1d(embedding, labels, names, colors, path, title):
     plt.close(fig)
 
 
-def plot_pca_2d(embedding, var_ratio, labels, names, colors, path, weight_dir=None):
+def plot_pca_2d(embedding, var_ratio, labels, names, colors, path, boundary=None, truncated=None):
+    """PCA of the final state, one colour per class.
+
+    boundary: (a, c) of the readout decision line a . p + c = 0 in PC coordinates (binary tasks).
+    truncated: per-sample bool; splits each class into padded (light) and truncated (full colour) reviews.
+    """
     fig, ax = plt.subplots(figsize=(8.8, 6.4))
-    classes = sorted(np.unique(labels).tolist())
-    for c in classes:
-        mask = labels == c
-        ax.scatter(
-            embedding[mask, 0],
-            embedding[mask, 1],
-            s=14,
-            alpha=SCATTER_ALPHA,
-            color=colors[c],
-            label=names[c],
-            edgecolors="none",
-        )
-    if weight_dir is not None and embedding.shape[1] >= 2:
-        span = max(np.ptp(embedding[:, 0]), np.ptp(embedding[:, 1]), 1e-6)
-        vec = np.asarray(weight_dir, dtype=float)
-        if vec.shape[0] >= 2 and np.linalg.norm(vec[:2]) > 0:
-            vec = vec[:2]
-            vec = vec / (np.linalg.norm(vec) + 1e-12) * 0.35 * span
-            ax.annotate(
-                "",
-                xy=(vec[0], vec[1]),
-                xytext=(0, 0),
-                arrowprops=dict(arrowstyle="->", color="k", lw=1.4),
-            )
-            ax.text(vec[0], vec[1], r"$W$ dir.", fontsize=12, ha="left", va="bottom")
+    groups = [(c, None) for c in sorted(np.unique(labels).tolist())]
+    if truncated is not None:
+        groups = [(c, t) for c, _ in groups for t in (False, True)]
+    for c, t in groups:
+        mask = labels == c if t is None else (labels == c) & (truncated == t)
+        color = colors[c] if t in (None, True) else tuple(0.55 * np.asarray(mcolors.to_rgb(colors[c])) + 0.45)
+        label = names[c] if t is None else f"{names[c]}, {'truncated' if t else 'padded'}"
+        ax.scatter(embedding[mask, 0], embedding[mask, 1], s=14, alpha=SCATTER_ALPHA, color=color,
+                   label=label, edgecolors="none")
+    if boundary is not None:
+        a, c = boundary
+        xlim, ylim = ax.get_xlim(), ax.get_ylim()
+        if abs(a[1]) > abs(a[0]):
+            xs = np.array(xlim)
+            ax.plot(xs, -(a[0] * xs + c) / a[1], color="k", linewidth=1.5, label="decision boundary")
+        else:
+            ys = np.array(ylim)
+            ax.plot(-(a[1] * ys + c) / a[0], ys, color="k", linewidth=1.5, label="decision boundary")
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
     var0 = 100.0 * float(var_ratio[0]) if var_ratio is not None and len(var_ratio) > 0 else 0.0
     var1 = 100.0 * float(var_ratio[1]) if var_ratio is not None and len(var_ratio) > 1 else 0.0
     ax.set_xlabel(f"PC1 ({var0:.1f}\\%)")
     ax.set_ylabel(f"PC2 ({var1:.1f}\\%)")
-    ax.set_title(r"PCA of last $z$ (linear view of $h2o$ input)")
-    _legend_outside_right(ax)
+    ax.legend(loc="upper right", fontsize=10, markerscale=1.5)
     fig.tight_layout()
     fig.savefig(path, transparent=True)
     plt.close(fig)
@@ -1744,14 +1734,21 @@ def plot_all_readout_analysis(payload, output_dir, task, seed=1):
             seed=seed,
         )
 
-    pca_emb, var_ratio = _fit_pca(feat_e, 2)
-    weight_dir = None
-    if pca_emb is not None and task == "imdb" and weight.shape[0] == 2:
-        from sklearn.decomposition import PCA
-        pca = PCA(n_components=min(2, feat_e.shape[1]), random_state=0)
-        pca.fit(feat_e)
-        delta_w = weight[1] - weight[0]
-        weight_dir = pca.components_ @ delta_w
+    from sklearn.decomposition import PCA
+
+    pca_emb = var_ratio = boundary = truncated = None
+    if min(feat_e.shape) >= 2:
+        pca = PCA(n_components=2, random_state=0)
+        pca_emb = pca.fit_transform(feat_e)
+        var_ratio = pca.explained_variance_ratio_
+        if task == "imdb" and weight.shape[0] == 2:
+            # logit difference dw.f + db = 0 with f = mean + V^T p gives a line in the PC plane
+            delta_w = weight[1] - weight[0]
+            delta_b = float(payload["h2o_bias"][1] - payload["h2o_bias"][0])
+            boundary = (pca.components_ @ delta_w, float(delta_w @ pca.mean_) + delta_b)
+            if payload.get("review_n_tokens") is not None:
+                n_tok = np.asarray(payload["review_n_tokens"])[embed_mask]
+                truncated = n_tok >= int(payload.get("review_max_len", 175))
     if pca_emb is not None:
         if use_gradient:
             var0 = 100.0 * float(var_ratio[0]) if var_ratio is not None and len(var_ratio) > 0 else 0.0
@@ -1769,7 +1766,8 @@ def plot_all_readout_analysis(payload, output_dir, task, seed=1):
             plot_pca_2d(
                 pca_emb, var_ratio, lab_e, names, colors,
                 p("readout_pca_2d.png"),
-                weight_dir=weight_dir,
+                boundary=boundary,
+                truncated=truncated,
             )
 
     score = plot_linear_decision(

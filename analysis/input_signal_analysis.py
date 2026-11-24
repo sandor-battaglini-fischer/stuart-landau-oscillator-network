@@ -21,27 +21,11 @@ apply_style()
 
 mg_cmap = mcolors.LinearSegmentedColormap.from_list("mg_cmap", [(0.5, 0.6, 0.0), ifisc_green])
 
-from training.train_mackey_glass import MackeyGlassDataset, generate_mackey_glass, build_dataloaders
-from models import SLON, HORN
+from models import HORN
+from training.train_imdb import SLONWithEmbedding, download_glove, load_glove_vectors, load_imdb_data
+from training.train_mackey_glass import MackeyGlassDataset, build_dataloaders, generate_mackey_glass
 from utils.model_factory import build_oscillator
 from utils.plotting_utils.mackey_glass_encoding import plot_mackey_glass_encoding_analysis_from_loader
-from training.train_imdb import (
-    tokenize,
-    Vocabulary,
-    download_imdb,
-    load_imdb_reviews,
-    load_preprocessed_data,
-    save_preprocessed_data,
-    download_glove,
-    load_glove_vectors,
-    SLONWithEmbedding,
-)
-
-# TASK_COLORS = {
-#     "smnist": ifisc_green,
-#     "imdb": thesis_blue,
-#     "mackey_glass": thesis_red,
-# }
 
 TASK_COLORS = {
     "smnist": "black",
@@ -148,64 +132,6 @@ def compute_pre_activations(model, inputs, random_init=None):
     return compute_pre_activations_stuart_landau(model, inputs, random_init=random_init)
 
 
-def simulate_stuart_landau_base(lambda_param, omega, gamma_real, gamma_imag, h, num_steps, z0=None):
-    dtype = torch.float64
-    if z0 is None:
-        z = torch.complex(torch.tensor(1.0, dtype=dtype), torch.tensor(0.0, dtype=dtype))
-    else:
-        z = torch.complex(torch.tensor(z0[0], dtype=dtype), torch.tensor(z0[1], dtype=dtype))
-
-    lambda_omega = torch.complex(torch.tensor(lambda_param, dtype=dtype), torch.tensor(omega, dtype=dtype))
-    gamma = torch.complex(torch.tensor(gamma_real, dtype=dtype), torch.tensor(gamma_imag, dtype=dtype))
-
-    traj_real = []
-    for _ in range(num_steps):
-        dz_dt = lambda_omega * z + gamma * torch.abs(z) ** 2 * z
-        z = z + h * dz_dt
-        traj_real.append(torch.real(z).item())
-
-    return np.array(traj_real)
-
-
-def plot_time_and_frequency(pre_acts, output_dir, prefix, num_units=5, sample_mean=True):
-    os.makedirs(output_dir, exist_ok=True)
-
-    if sample_mean:
-        series = pre_acts.mean(dim=1)
-    else:
-        series = pre_acts[:, 0, :]
-
-    series = series.numpy()
-    num_timesteps, num_nodes = series.shape
-    unit_indices = list(range(min(num_units, num_nodes)))
-
-    t = np.arange(num_timesteps)
-
-    plt.figure(figsize=(10, 6))
-    for idx in unit_indices:
-        plt.plot(t, series[:, idx], label=f"unit {idx}")
-    plt.xlabel("time step")
-    plt.ylabel("pre-activation")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f"{prefix}_time_series.png"), transparent=True)
-    plt.close()
-
-    freqs = np.fft.rfftfreq(num_timesteps, d=1.0)
-
-    plt.figure(figsize=(10, 6))
-    for idx in unit_indices:
-        fft_vals = np.fft.rfft(series[:, idx])
-        amp = np.abs(fft_vals)
-        plt.plot(freqs, amp, label=f"unit {idx}")
-    plt.xlabel("frequency")
-    plt.ylabel("amplitude")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f"{prefix}_frequency_spectrum.png"), transparent=True)
-    plt.close()
-
-
 def plot_single_example_time_series(pre_acts, output_dir, prefix, num_units=5, example_idx=0):
     os.makedirs(output_dir, exist_ok=True)
 
@@ -276,103 +202,16 @@ def get_smnist_pre_acts(args, model=None, return_model=False):
     return pre_acts, pixel_trace
 
 
-def get_imdb_pre_acts(args, model=None, vocab=None, return_model=False):
+def get_imdb_pre_acts(args, model=None, return_model=False):
     torch.manual_seed(args.seed)
+    if args.omega is None:
+        args.omega = 2 * math.pi / (args.max_len * args.h)
 
-    target_period = args.max_len
-    if not args.sweep_omega:
-        args.omega = (2 * math.pi) / (target_period * args.h)
-
+    vocab, train_data, _ = load_imdb_data(args.cache_dir, args.min_freq, args.max_len, args.force_reprocess)
+    vocab_size = len(vocab)
+    pad_idx = vocab.word2idx["<pad>"]
     dim_input = args.embed_dim
     dim_output = 2
-
-    if vocab is None:
-        cached_data = None
-        if not args.force_reprocess:
-            cached_data = load_preprocessed_data(args.cache_dir, args.min_freq, args.max_len)
-
-        if cached_data is not None:
-            vocab, train_tokens, test_tokens, train_labels, test_labels = cached_data
-            vocab_size = len(vocab)
-            pad_idx = vocab.word2idx["<pad>"]
-
-            def process_tokens_to_ids(tokens_list, pad):
-                token_ids_list = []
-                for tokens in tokens_list:
-                    token_ids = vocab(tokens)
-                    if len(token_ids) > args.max_len:
-                        token_ids = token_ids[: args.max_len]
-                    else:
-                        token_ids = token_ids + [pad] * (args.max_len - len(token_ids))
-                    token_ids_list.append(token_ids)
-                return token_ids_list
-
-            train_token_ids = process_tokens_to_ids(train_tokens, pad_idx)
-            train_data = [
-                (torch.tensor(token_ids, dtype=torch.long), torch.tensor(label, dtype=torch.long))
-                for token_ids, label in zip(train_token_ids, train_labels)
-            ]
-        else:
-            imdb_path = download_imdb()
-            train_texts, train_labels = load_imdb_reviews(imdb_path, "train")
-
-            vocab = Vocabulary(min_freq=args.min_freq)
-
-            train_tokens = [tokenize(text) for text in train_texts]
-
-            for tokens in train_tokens:
-                vocab.word_counts.update(tokens)
-
-            vocab.word2idx["<pad>"] = 0
-            vocab.word2idx["<unk>"] = 1
-            idx = 2
-            for word, count in vocab.word_counts.items():
-                if count >= args.min_freq:
-                    vocab.word2idx[word] = idx
-                    idx += 1
-
-            vocab.idx2word = {idx: word for word, idx in vocab.word2idx.items()}
-            vocab_size = len(vocab)
-            pad_idx = vocab.word2idx["<pad>"]
-
-            save_preprocessed_data(
-                args.cache_dir, vocab, train_tokens, train_tokens, train_labels, train_labels, args.min_freq, args.max_len
-            )
-
-            def process_tokens_to_ids(tokens, pad):
-                token_ids = vocab(tokens)
-                if len(token_ids) > args.max_len:
-                    token_ids = token_ids[: args.max_len]
-                else:
-                    token_ids = token_ids + [pad] * (args.max_len - len(token_ids))
-                return token_ids
-
-            train_token_ids = [process_tokens_to_ids(tokens, pad_idx) for tokens in train_tokens]
-            train_data = [
-                (torch.tensor(token_ids, dtype=torch.long), torch.tensor(label, dtype=torch.long))
-                for token_ids, label in zip(train_token_ids, train_labels)
-            ]
-    else:
-        vocab_size = len(vocab)
-        pad_idx = vocab.word2idx["<pad>"]
-        cached_data = load_preprocessed_data(args.cache_dir, args.min_freq, args.max_len)
-        if cached_data is not None:
-            _, train_tokens, _, train_labels, _ = cached_data
-            def process_tokens_to_ids(tokens_list, pad):
-                token_ids_list = []
-                for tokens in tokens_list:
-                    token_ids = vocab(tokens)
-                    if len(token_ids) > args.max_len:
-                        token_ids = token_ids[: args.max_len]
-                    else:
-                        token_ids = token_ids + [pad] * (args.max_len - len(token_ids))
-                    token_ids_list.append(token_ids)
-                return token_ids_list
-            train_token_ids = process_tokens_to_ids(train_tokens, pad_idx)
-            train_data = [
-                (torch.tensor(token_ids, dtype=torch.long), torch.tensor(label, dtype=torch.long))
-                for token_ids, label in zip(train_token_ids, train_labels)
-            ]
 
     embedding_weights = None
     if args.glove:
@@ -422,7 +261,7 @@ def get_imdb_pre_acts(args, model=None, vocab=None, return_model=False):
     pre_acts = compute_pre_activations(model.slon, embedded, random_init=args.random_init)
     embed_mag_trace = embedded[:, 0, :].norm(dim=-1).detach().cpu().numpy()
     if return_model:
-        return pre_acts, embed_mag_trace, model, vocab
+        return pre_acts, embed_mag_trace, model
     return pre_acts, embed_mag_trace
 
 
@@ -865,7 +704,6 @@ def analyze_compare(args):
     pre_acts_imdb = None
     embed_mag_trace = None
     model_im = None
-    vocab_im = None
     if use_im:
         imdb_args = SimpleNamespace(
             dynamics=args.dynamics,
@@ -888,7 +726,6 @@ def analyze_compare(args):
             weight_decay=0.05,
             glove=args.glove,
             glove_dir=args.glove_dir,
-            sweep_omega=False,
             cache_dir=args.cache_dir,
             force_reprocess=args.force_reprocess,
             random_init=args.random_init,
@@ -896,7 +733,7 @@ def analyze_compare(args):
             checkpoint=args.checkpoint,
             shuffle=getattr(args, "shuffle", False),
         )
-        pre_acts_imdb, embed_mag_trace, model_im, vocab_im = get_imdb_pre_acts(imdb_args, return_model=True)
+        pre_acts_imdb, embed_mag_trace, model_im = get_imdb_pre_acts(imdb_args, return_model=True)
 
     mg_pre_acts_list = []
     mg_trace_list = []
@@ -1040,7 +877,7 @@ def analyze_compare(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyze pre-nonlinearity inputs for HORN on sMNIST, IMDB, and Mackey-Glass")
+    parser = argparse.ArgumentParser(description="Pre-nonlinearity input statistics on sMNIST, IMDb and Mackey-Glass")
     subparsers = parser.add_subparsers(dest="dataset", required=True)
 
     smnist_parser = subparsers.add_parser("smnist", help="Analyze sMNIST input")
@@ -1050,7 +887,9 @@ def main():
     smnist_parser.add_argument("--seed", type=int, default=1)
     smnist_parser.add_argument("--h", type=float, default=1.0)
     smnist_parser.add_argument("--lambda-param", type=float, default=-0.04)
+    smnist_parser.add_argument("--alpha", type=float, default=0.05)
     smnist_parser.add_argument("--omega", type=float, default=0.224)
+    smnist_parser.add_argument("--gamma", type=float, default=0.01)
     smnist_parser.add_argument("--gamma-real", type=float, default=-0.05)
     smnist_parser.add_argument("--gamma-imag", type=float, default=0.1)
     smnist_parser.add_argument("--input-scale", type=float, default=1.0)
@@ -1058,6 +897,7 @@ def main():
     smnist_parser.add_argument("--checkpoint", type=str, default=None)
     smnist_parser.add_argument("--shuffle", action="store_true")
     smnist_parser.add_argument("--num-units-plot", type=int, default=5)
+    smnist_parser.add_argument("--output-dir", type=str, default=None)
 
     imdb_parser = subparsers.add_parser("imdb", help="Analyze IMDB input")
     imdb_parser.add_argument("--dynamics", type=str, default="sl", choices=["sl", "lo", "dho"])
@@ -1066,7 +906,9 @@ def main():
     imdb_parser.add_argument("--seed", type=int, default=1)
     imdb_parser.add_argument("--h", type=float, default=1.0)
     imdb_parser.add_argument("--lambda-param", type=float, default=-0.05)
-    imdb_parser.add_argument("--omega", type=float, default=0.224)
+    imdb_parser.add_argument("--alpha", type=float, default=0.5)
+    imdb_parser.add_argument("--omega", type=float, default=None, help="default: one period over --max-len")
+    imdb_parser.add_argument("--gamma", type=float, default=0.01)
     imdb_parser.add_argument("--gamma-real", type=float, default=-0.1)
     imdb_parser.add_argument("--gamma-imag", type=float, default=0.1)
     imdb_parser.add_argument("--embed-dim", type=int, default=100)
@@ -1075,13 +917,13 @@ def main():
     imdb_parser.add_argument("--dropout", type=float, default=0.3)
     imdb_parser.add_argument("--glove", type=str, default="glove.6B.100d.txt")
     imdb_parser.add_argument("--glove-dir", type=str, default="data/glove")
-    imdb_parser.add_argument("--sweep-omega", action="store_true")
     imdb_parser.add_argument("--cache-dir", type=str, default="data/imdb_cache")
     imdb_parser.add_argument("--force-reprocess", action="store_true")
     imdb_parser.add_argument("--random-init", type=float, default=None)
     imdb_parser.add_argument("--checkpoint", type=str, default=None)
     imdb_parser.add_argument("--input-scale", type=float, default=1.0)
     imdb_parser.add_argument("--num-units-plot", type=int, default=5)
+    imdb_parser.add_argument("--output-dir", type=str, default=None)
 
     mg_parser = subparsers.add_parser("mg", help="Analyze Mackey-Glass input")
     mg_parser.add_argument("--dynamics", type=str, default="sl", choices=["sl", "lo", "dho"])
@@ -1167,7 +1009,6 @@ def main():
     compare_parser.add_argument("--dropout", type=float, default=0.3)
     compare_parser.add_argument("--glove", type=str, default="glove.6B.100d.txt")
     compare_parser.add_argument("--glove-dir", type=str, default="data/glove")
-    compare_parser.add_argument("--sweep-omega", action="store_true")
     compare_parser.add_argument("--cache-dir", type=str, default="data/imdb_cache")
     compare_parser.add_argument("--force-reprocess", action="store_true")
     compare_parser.add_argument("--random-init", type=float, default=None)
