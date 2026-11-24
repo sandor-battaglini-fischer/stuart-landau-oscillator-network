@@ -1,10 +1,8 @@
-# Analysis utilities for SLON model
 import numpy as np
 import torch
 
 
 def extract_model_parameters(model, dynamics_type):
-    """Extract all trainable parameters from the model."""
     core = model.slon if hasattr(model, "slon") else model
 
     params = {
@@ -35,7 +33,6 @@ def extract_model_parameters(model, dynamics_type):
 
 
 def compute_parameter_statistics(params):
-    """Compute statistics for parameter tracking."""
     stats = {}
 
     for key, value in params.items():

@@ -3,10 +3,10 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-PYTHON="${ROOT}/.venv/bin/python"
+PYTHON="${PYTHON:-python}"
 OUT_DIR="${ROOT}/results/memory_capacity/ckpts/smnist_sl_lc"
 
-"$PYTHON" training/train_smnist.py \
+$PYTHON training/train_smnist.py \
   --dynamics sl \
   --num-hidden 50 \
   --alpha 0.04 \
@@ -19,7 +19,7 @@ OUT_DIR="${ROOT}/results/memory_capacity/ckpts/smnist_sl_lc"
   --skip-epoch-plots \
   --output-dir "$OUT_DIR"
 
-"$PYTHON" analysis/memory_capacity.py \
+$PYTHON analysis/memory_capacity.py \
   --task smnist \
   --run-dir "$OUT_DIR" \
   --probes noise,task \

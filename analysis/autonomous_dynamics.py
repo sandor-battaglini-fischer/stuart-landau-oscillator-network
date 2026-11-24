@@ -1,8 +1,4 @@
-"""Compare driven vs autonomous oscillator-network dynamics.
-
-Temporarily zeros the input projection (i2h weights and bias) while leaving
-recurrent coupling intact, then compares trajectories, forces, spectra, and
-λ–γ_r regime maps against the same network with drive.
+"""Driven vs autonomous dynamics: zero i2h, keep the recurrent coupling, compare trajectories and regimes.
 
 Examples:
   python analysis/autonomous_dynamics.py --task smnist --run-dir results/smnist/<run>
@@ -83,10 +79,6 @@ def _flag_explicit(name: str) -> bool:
     flag = "--" + name.replace("_", "-")
     return any(arg == flag or arg.startswith(flag + "=") for arg in sys.argv[1:])
 
-
-# ---------------------------------------------------------------------------
-# Temporary model configuration
-# ---------------------------------------------------------------------------
 
 @contextmanager
 def zero_input_path(core):
@@ -176,18 +168,9 @@ def apply_runtime_params(core, kwargs):
         core.gamma_imag.fill_(float(kwargs["gamma_imag"]))
 
 
-# ---------------------------------------------------------------------------
-# Rollout / metrics
-# ---------------------------------------------------------------------------
-
 @torch.no_grad()
 def rollout(core, inputs, init_a, init_b):
-    """Step the oscillator, recording states and input vs recurrent forces.
-
-    Args:
-        inputs: (T, B, F)
-        init_a, init_b: (B, N)  — (Re, Im) for SL/LO, (x, y) for DHO
-    """
+    """Step the oscillator from (init_a, init_b), recording states and the input vs recurrent force."""
     core.eval()
     kind = dynamics_kind(core)
     num_steps, batch_size, _ = inputs.shape
@@ -369,10 +352,6 @@ def run_pair(core, inputs, init_a, init_b):
     return driven, autonomous
 
 
-# ---------------------------------------------------------------------------
-# Model / drive loading
-# ---------------------------------------------------------------------------
-
 def merge_kwargs(args, log_params):
     src = log_params or {}
 
@@ -463,10 +442,6 @@ def resolve_output_dir(args):
     os.makedirs(path, exist_ok=True)
     return path
 
-
-# ---------------------------------------------------------------------------
-# Plotting
-# ---------------------------------------------------------------------------
 
 def _unit_indices(num_nodes, num_units):
     if num_nodes <= num_units:
@@ -738,10 +713,6 @@ def plot_regime_heatmap(grid, lambda_vals, gamma_vals, title, path, categorical=
     plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
-# Drivers
-# ---------------------------------------------------------------------------
-
 def _json_num(val):
     if val is None:
         return None
@@ -977,10 +948,6 @@ def write_log(path, payload, args, kwargs, drive_name, output_dir):
                 f"autonomous regime: {_fmt(payload['autonomous'])}\n"
             )
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def run(args):
     device = resolve_device(args.device)

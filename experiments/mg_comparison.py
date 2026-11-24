@@ -5,13 +5,12 @@ import json
 from datetime import datetime
 from itertools import product
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 import numpy as np
 import torch
-from tqdm import tqdm
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.patches as mpatches
@@ -19,275 +18,60 @@ import matplotlib.patches as mpatches
 from utils.plotting_utils.style import apply_style, thesis_red, thesis_blue, ifisc_green, mycmap
 apply_style()
 
-from training.train_mackey_glass import (
-    build_dataloaders,
-    evaluate_r2,
-    evaluate_model,
-    evaluate_normalized_error,
-    NormalizedErrorLoss,
-)
+from training.train_mackey_glass import build_parser as build_mg_parser
+from training.train_mackey_glass import collect_all_test_predictions, run_training, split_bounds
 
-def run_single_training(args, param_overrides, run_idx, total_runs):
-    modified_args = argparse.Namespace(**vars(args))
-    for key, value in param_overrides.items():
-        setattr(modified_args, key, value)
-    
-    horizon_value = param_overrides.get('horizon', modified_args.horizon)
-    mg_tau_value = param_overrides.get('mg_tau', modified_args.mg_tau)
-    
-    (
-        train_loader,
-        val_loader,
-        test_loader,
-        full_series,
-        _,
-        _,
-    ) = build_dataloaders(
-        series_length=modified_args.series_length,
-        input_length=modified_args.input_length,
-        horizon=horizon_value,
-        batch_size=modified_args.batch_size,
-        val_fraction=modified_args.val_fraction,
-        test_fraction=modified_args.test_fraction,
-        tau=mg_tau_value,
-        delta_t=modified_args.mg_delta_t,
-        beta=modified_args.mg_beta,
-        gamma_mg=modified_args.mg_gamma,
-        n=modified_args.mg_n,
-        x0=modified_args.mg_x0,
-        seed=modified_args.seed,
-        remove_top_n_freqs=param_overrides.get('remove_top_n_freqs', getattr(modified_args, 'remove_top_n_freqs', 0)),
+
+def run_single_training(args, param_overrides, run_idx, total_runs, output_dir):
+    """Train one configuration with the standard Mackey-Glass trainer and collect its curves and predictions."""
+    run_args = vars(build_mg_parser().parse_args([]))
+    run_args.update({k: v for k, v in vars(args).items() if k in run_args})
+    run_args.update(param_overrides)
+    run_args.update(
+        output_dir=os.path.join(output_dir, 'runs', f'run{run_idx:03d}'),
+        early_stop_patience=args.epochs + 1,
+        sweep_mode=True,
+        skip_epoch_plots=True,
     )
+    run_args = argparse.Namespace(**run_args)
+    print(f'Run {run_idx + 1}/{total_runs} -> {run_args.output_dir}')
 
-    lambda_value = param_overrides.get('lambda_param', None)
-    omega_value = param_overrides.get('omega', modified_args.omega)
-    lambda_param = lambda_value if lambda_value is not None else modified_args.lambda_param
+    _, model, test_loader, full_series = run_training(run_args, return_model=True)
+    with open(os.path.join(run_args.output_dir, 'metrics.json')) as f:
+        metrics = [m for m in json.load(f) if m['epoch'] >= 0]
 
-    if modified_args.dynamics == "sl":
-        from models import SLON
-        model = SLON(
-            1,
-            modified_args.num_hidden,
-            1,
-            modified_args.h,
-            modified_args.alpha,
-            omega_value,
-            modified_args.gamma,
-            lambda_param=lambda_param,
-            gamma_real=modified_args.gamma_real,
-            gamma_imag=modified_args.gamma_imag,
-        )
-    else:
-        from models import SLON
-        model = SLON(1, modified_args.num_hidden, 1, modified_args.h, modified_args.alpha, omega_value, modified_args.gamma)
-
-    mse_loss_fn = torch.nn.MSELoss()
-    loss_fn = NormalizedErrorLoss(epsilon=1e-3, max_ratio=100.0, min_denominator=1e-4)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=modified_args.lr, weight_decay=1e-5)
-    
-    warmup_epochs = max(5, modified_args.epochs // 20)
-    cosine_epochs = modified_args.epochs - warmup_epochs
-    
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            return (epoch + 1) / warmup_epochs
-        else:
-            progress = (epoch - warmup_epochs) / cosine_epochs
-            progress_powered = progress ** modified_args.lr_decay_power
-            cosine_decay = 0.5 * (1 + np.cos(np.pi * progress_powered))
-            return max(cosine_decay, modified_args.min_lr_ratio)
-    
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    
-    for param_group in optimizer.param_groups:
-        param_group['initial_lr'] = modified_args.lr
-    
-    batch_size = modified_args.batch_size
-    
-    test_r2_scores = []
-    val_r2_scores = []
-    test_mse_scores = []
-    val_mse_scores = []
-    
-    for epoch in tqdm(range(modified_args.epochs), total=modified_args.epochs, desc=f"Run {run_idx+1}/{total_runs}"):
-        model.train()
-        epoch_loss = 0.0
-        count = 0
-
-        for batch in train_loader:
-            if len(batch) == 4:
-                inputs, targets, _, prev_values = batch
-            elif len(batch) == 3:
-                inputs, targets, _ = batch
-                prev_values = None
-            else:
-                inputs, targets = batch
-                prev_values = None
-            inputs = inputs.permute(1, 0, 2)
-            optimizer.zero_grad()
-            out = model(inputs)
-            preds = out["output"]
-            
-            if prev_values is not None and isinstance(loss_fn, NormalizedErrorLoss):
-                loss = loss_fn(preds, targets, prev_values)
-            else:
-                loss = mse_loss_fn(preds, targets)
-            
-            if torch.isnan(loss) or torch.isinf(loss):
-                tqdm.write(f"ERROR: NaN/Inf loss detected at epoch {epoch}. Stopping training.")
-                raise ValueError("NaN/Inf loss detected - training stopped")
-
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                optimizer.zero_grad()
-                continue
-            
-            optimizer.step()
-            batch_size_current = inputs.size(1)
-            epoch_loss += loss.item() * batch_size_current
-            count += batch_size_current
-
-        val_mse = evaluate_model(
-            val_loader, model, mse_loss_fn, batch_size_test=batch_size, mse_loss_fn=mse_loss_fn
-        )
-        test_mse = evaluate_model(
-            test_loader, model, mse_loss_fn, batch_size_test=batch_size, mse_loss_fn=mse_loss_fn
-        )
-        
-        val_r2 = evaluate_r2(val_loader, model, batch_size_test=batch_size)
-        test_r2 = evaluate_r2(test_loader, model, batch_size_test=batch_size)
-        
-        scheduler.step()
-        
-        test_r2_scores.append(test_r2)
-        val_r2_scores.append(val_r2)
-        test_mse_scores.append(test_mse)
-        val_mse_scores.append(val_mse)
-    
-    model.eval()
-    all_test_preds = []
-    all_test_targets = []
-    all_test_indices = []
-    
-    total_len = int(modified_args.series_length * (1 - modified_args.test_fraction - modified_args.val_fraction))
-    val_len = int(modified_args.series_length * modified_args.val_fraction)
-    test_start = total_len + val_len
-    
-    with torch.no_grad():
-        for batch in test_loader:
-            if len(batch) == 4:
-                inputs, targets, sampled_indices, _ = batch
-            elif len(batch) == 3:
-                inputs, targets, sampled_indices = batch
-            else:
-                inputs, targets = batch
-                sampled_indices = None
-            
-            inputs = inputs.permute(1, 0, 2)
-            out = model(inputs)
-            preds = out["output"]
-            
-            preds_np = preds.detach().cpu().numpy().reshape(-1)
-            targets_np = targets.detach().cpu().numpy().reshape(-1)
-            
-            all_test_preds.append(preds_np)
-            all_test_targets.append(targets_np)
-            
-            if sampled_indices is not None:
-                sampled_indices_np = sampled_indices.detach().cpu().numpy()
-                for sampled_idx in sampled_indices_np:
-                    last_sampled_idx = int(sampled_idx)
-                    target_idx_absolute = test_start + last_sampled_idx + horizon_value
-                    all_test_indices.append(target_idx_absolute)
-            else:
-                for _ in range(len(preds_np)):
-                    all_test_indices.append(None)
-    
-    all_test_preds = np.concatenate(all_test_preds)
-    all_test_targets = np.concatenate(all_test_targets)
-    
+    test_start = split_bounds(run_args.series_length, run_args.val_fraction, run_args.test_fraction)[1]
+    preds, targets, target_indices, _ = collect_all_test_predictions(test_loader, model, test_start, run_args.horizon)
     return {
-        'test_r2_scores': test_r2_scores,
-        'val_r2_scores': val_r2_scores,
-        'test_mse_scores': test_mse_scores,
-        'val_mse_scores': val_mse_scores,
+        'test_r2_scores': [m['test_r2'] for m in metrics],
+        'val_r2_scores': [m['val_r2'] for m in metrics],
+        'test_mse_scores': [m['test_mse'] for m in metrics],
+        'val_mse_scores': [m['val_mse'] for m in metrics],
         'param_overrides': param_overrides,
-        'test_predictions': all_test_preds,
-        'test_targets': all_test_targets,
-        'test_indices': all_test_indices,
+        'test_predictions': preds,
+        'test_targets': targets,
+        'test_indices': target_indices,
         'full_series': full_series,
         'test_start_idx': test_start,
     }
 
 
 def generate_param_combinations(args):
-    param_configs = []
-    
-    if args.num_hidden_list:
-        num_hidden_values = [int(x) for x in args.num_hidden_list.split(',')]
-    else:
-        num_hidden_values = [args.num_hidden]
-    
-    if args.h_list:
-        h_values = [float(x) for x in args.h_list.split(',')]
-    else:
-        h_values = [args.h]
-    
-    if args.alpha_list:
-        alpha_values = [float(x) for x in args.alpha_list.split(',')]
-    else:
-        alpha_values = [args.alpha]
-    
-    if args.omega_list:
-        omega_values = [float(x) for x in args.omega_list.split(',')]
-    else:
-        omega_values = [args.omega]
-    
-    if args.gamma_list:
-        gamma_values = [float(x) for x in args.gamma_list.split(',')]
-    else:
-        gamma_values = [args.gamma]
-    
-    if args.lambda_list and args.dynamics == "sl":
-        lambda_values = [float(x) for x in args.lambda_list.split(',')]
-    else:
-        lambda_values = [args.lambda_param] if args.dynamics == "sl" else [None]
-    
-    if args.mg_tau_list:
-        mg_tau_values = [float(x) for x in args.mg_tau_list.split(',')]
-    else:
-        mg_tau_values = [args.mg_tau]
-    
-    if args.horizon_list:
-        horizon_values = [int(x) for x in args.horizon_list.split(',')]
-    else:
-        horizon_values = [args.horizon]
-    
-    if hasattr(args, 'remove_top_n_freqs_list') and args.remove_top_n_freqs_list:
-        remove_freqs_values = [int(x) for x in args.remove_top_n_freqs_list.split(',')]
-    else:
-        remove_freqs_values = [getattr(args, 'remove_top_n_freqs', 0)]
-    
-    for num_hidden, h, alpha, omega, gamma, lambda_val, mg_tau, horizon, remove_freqs in product(
-        num_hidden_values, h_values, alpha_values, omega_values, gamma_values, lambda_values, mg_tau_values, horizon_values, remove_freqs_values
-    ):
-        config = {
-            'num_hidden': num_hidden,
-            'h': h,
-            'alpha': alpha,
-            'omega': omega,
-            'gamma': gamma,
-            'mg_tau': mg_tau,
-            'horizon': horizon,
-            'remove_top_n_freqs': remove_freqs,
-        }
-        if lambda_val is not None:
-            config['lambda_param'] = lambda_val
-        param_configs.append(config)
-    
-    return param_configs
+    def values(list_arg, default, cast=float):
+        return [cast(x) for x in list_arg.split(',')] if list_arg else [default]
+
+    grid = {
+        'num_hidden': values(args.num_hidden_list, args.num_hidden, int),
+        'h': values(args.h_list, args.h),
+        'alpha': values(args.alpha_list, args.alpha),
+        'omega': values(args.omega_list, args.omega),
+        'gamma': values(args.gamma_list, args.gamma),
+        'lambda_param': values(args.lambda_list, args.lambda_param),
+        'mg_tau': values(args.mg_tau_list, args.mg_tau),
+        'horizon': values(args.horizon_list, args.horizon, int),
+        'remove_top_n_freqs': values(args.remove_top_n_freqs_list, args.remove_top_n_freqs, int),
+    }
+    return [dict(zip(grid, combo)) for combo in product(*grid.values())]
 
 
 def create_label(param_overrides):
@@ -1041,15 +825,11 @@ def regenerate_plots(data_file, output_dir=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="HORN comparison script for Mackey-Glass prediction with multiple parameter values"
+        description="Train Mackey-Glass models over a grid of parameter values and compare them"
     )
-    parser.add_argument(
-        "--dynamics",
-        type=str,
-        default="sl",
-        choices=["dho", "sl"],
-        help="dynamics type: dho or sl",
-    )
+    parser.add_argument("--dynamics", type=str, default="sl", choices=["sl", "lo", "dho"])
+    parser.add_argument("--no-tanh", action="store_true")
+    parser.add_argument("--device", type=str, default="cpu", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--num-hidden", type=int, default=50)
     parser.add_argument("--num-hidden-list", type=str, default=None,
                         help="Comma-separated list of num_hidden values (e.g., '25,50,100')")
@@ -1111,9 +891,6 @@ def main():
         regenerate_plots(args.regenerate_plots, args.output_dir)
         return
 
-    if args.lambda_list and args.dynamics != "sl":
-        raise ValueError("Lambda list is only available for Stuart-Landau dynamics")
-
     torch.manual_seed(args.seed)
 
     param_configs = generate_param_combinations(args)
@@ -1139,7 +916,7 @@ def main():
         print("-" * 80)
         
         try:
-            result = run_single_training(args, param_overrides, run_idx, total_runs)
+            result = run_single_training(args, param_overrides, run_idx, total_runs, output_dir)
             all_results.append(result)
             print(f"Completed: test R² final = {result['test_r2_scores'][-1]:.6f}")
             

@@ -1,33 +1,24 @@
+import argparse
 import json
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-from matplotlib.patches import Patch
 import os
 import sys
 
+import matplotlib.colors as mcolors
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.patches import Patch
+from tqdm import tqdm
+
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+sys.path.insert(0, PROJECT_ROOT)
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, "results", "dynamics")
 
-from utils.plotting_utils.style import apply_style, thesis_red, thesis_blue, ifisc_green, mycmap
+from utils.plotting_utils.style import apply_style, ifisc_green, thesis_blue, thesis_red
+
 apply_style()
-
-
-try:
-    from tqdm.auto import tqdm
-except ImportError:
-
-    def tqdm(x, *args, **kwargs):
-        return x
-
 
 plt.rcParams.update(
     {
-        "text.usetex": True,
-        "font.family": "serif",
-        "font.serif": ["newpx"],
-    "text.latex.preamble": r"\usepackage{newpxtext,newpxmath}",
         "font.size": 8,
         "axes.titlesize": 8,
         "axes.labelsize": 8,
@@ -50,13 +41,6 @@ plt.rcParams.update(
     }
 )
 
-
-thesis_blue = (0, 0.38, 0.68)
-ifisc_green = (0.73, 0.83, 0.01)
-
-mycmap = mcolors.LinearSegmentedColormap.from_list(
-    "sl_cmap", [thesis_blue, ifisc_green, thesis_red]
-)
 
 
 def simulate_stuart_landau(
@@ -81,106 +65,6 @@ def simulate_stuart_landau(
         z[i + 1] = z[i] + dt * dz
 
     return t, z
-
-
-def compute_bifurcation(
-    lambda_values,
-    omega,
-    gamma_real=-1.0,
-    gamma_imag=0.0,
-    dt=0.001,
-    t_max=400.0,
-    transient_fraction=0.5,
-):
-    steady_amplitudes = []
-    regime_labels = []
-
-    for lam in tqdm(lambda_values, desc="1D bifurcation", leave=False):
-        _, z = simulate_stuart_landau(
-            lambda_param=lam,
-            omega=omega,
-            gamma_real=gamma_real,
-            gamma_imag=gamma_imag,
-            z0=0.1 + 0.0j,
-            dt=dt,
-            t_max=t_max,
-        )
-
-        start_idx = int(len(z) * transient_fraction)
-        r = np.abs(z[start_idx:])
-        r_mean = np.mean(r)
-
-        steady_amplitudes.append(r_mean)
-
-        if r_mean < 1e-3:
-            regime_labels.append("fixed_point")
-        else:
-            regime_labels.append("limit_cycle")
-
-    return np.array(steady_amplitudes), np.array(regime_labels)
-
-
-def compute_parameter_hypercube(
-    lambda_values,
-    gamma_real_values,
-    gamma_imag_values,
-    omega_values,
-    dt=0.03,
-    t_max=150.0,
-    transient_fraction=0.5,
-    diverging_threshold=5.0,
-):
-    shape = (
-        len(omega_values),
-        len(gamma_imag_values),
-        len(gamma_real_values),
-        len(lambda_values),
-    )
-    regime_codes = np.zeros(shape, dtype=int)
-    mean_amplitudes = np.zeros(shape, dtype=float)
-
-    total = (
-        len(omega_values)
-        * len(gamma_imag_values)
-        * len(gamma_real_values)
-        * len(lambda_values)
-    )
-
-    with tqdm(total=total, desc="4D parameter scan") as pbar:
-        for io, omega in enumerate(omega_values):
-            for ii, gi in enumerate(gamma_imag_values):
-                for ir, gr in enumerate(gamma_real_values):
-                    for jl, lam in enumerate(lambda_values):
-                        _, z = simulate_stuart_landau(
-                            lambda_param=lam,
-                            omega=omega,
-                            gamma_real=gr,
-                            gamma_imag=gi,
-                            z0=0.1 + 0.0j,
-                            dt=dt,
-                            t_max=t_max,
-                        )
-
-                        r = np.abs(z)
-
-                        if np.any(r > diverging_threshold) or not np.all(
-                            np.isfinite(r)
-                        ):
-                            regime_codes[io, ii, ir, jl] = 2
-                        else:
-                            start_idx = int(len(r) * transient_fraction)
-                            r_ss = r[start_idx:]
-                            r_mean = float(np.mean(r_ss))
-                            mean_amplitudes[io, ii, ir, jl] = r_mean
-
-                            if r_mean < 1e-3:
-                                regime_codes[io, ii, ir, jl] = 0
-                            else:
-                                regime_codes[io, ii, ir, jl] = 1
-
-                        pbar.update(1)
-
-    return regime_codes, mean_amplitudes
 
 
 def compute_parameter_plane_2d(
@@ -265,122 +149,65 @@ def compute_parameter_plane_2d_analytic(
     return regime_codes, mean_amplitudes
 
 
-def main():
-    omega = 1.0
-    gamma_imag = 0.0
-
-    lambda_values = np.linspace(-2.0, 2.0, 201)
-    gamma_real_values = np.linspace(-2.0, 2.0, 201)
-
-    regime_plane, mean_amp_plane = compute_parameter_plane_2d(
-        lambda_values,
-        gamma_real_values,
-        omega=omega,
-        gamma_imag=gamma_imag,
-        dt=0.05,
-        t_max=150.0,
-        transient_fraction=0.5,
-        diverging_threshold=5.0,
-    )
-    regime_plane_analytic, mean_amp_plane_analytic = compute_parameter_plane_2d_analytic(
-        lambda_values,
-        gamma_real_values,
-        z0_abs=0.1,
-    )
-
-    scan_data = {
-        "lambda_values": lambda_values.tolist(),
-        "gamma_real_values": gamma_real_values.tolist(),
-        "regime_plane": regime_plane.tolist(),
-        "mean_amplitude_plane": mean_amp_plane.tolist(),
-        "regime_plane_analytic": regime_plane_analytic.tolist(),
-        "mean_amplitude_plane_analytic": mean_amp_plane_analytic.tolist(),
-        "omega": float(omega),
-        "gamma_imag": float(gamma_imag),
-    }
-
-    with open("stuart_landau_lambda_gamma_r_plane_highres.json", "w") as f:
-        json.dump(scan_data, f, indent=2)
-
-    fig, ax = plt.subplots(figsize=(8.0, 6.0))
-
+def plot_regime_plane(plane, lambda_values, gamma_real_values, path):
     regime_cmap = mcolors.ListedColormap([thesis_blue, ifisc_green, thesis_red])
-    bounds = [-0.5, 0.5, 1.5, 2.5]
-    norm = mcolors.BoundaryNorm(bounds, regime_cmap.N)
-
-    im = ax.imshow(
-        regime_plane,
-        origin="lower",
-        aspect="equal",
-        extent=[
-            lambda_values[0],
-            lambda_values[-1],
-            gamma_real_values[0],
-            gamma_real_values[-1],
-        ],
-        cmap=regime_cmap,
-        norm=norm,
-    )
-
+    norm = mcolors.BoundaryNorm([-0.5, 0.5, 1.5, 2.5], regime_cmap.N)
+    fig, ax = plt.subplots(figsize=(8.0, 6.0))
+    ax.imshow(plane, origin="lower", aspect="equal", cmap=regime_cmap, norm=norm,
+              extent=[lambda_values[0], lambda_values[-1], gamma_real_values[0], gamma_real_values[-1]])
     ax.set_xlabel(r"$\lambda$", fontsize=18)
     ax.set_ylabel(r"$\gamma_\mathrm{r}$", fontsize=18)
     ax.tick_params(labelsize=14)
-
-    legend_handles = [
-        Patch(facecolor=thesis_blue, label="Stable fixed point"),
-        Patch(facecolor=ifisc_green, label="Stable limit cycle"),
-        Patch(facecolor=thesis_red, label="Unstable limit cycle"),
-    ]
     ax.legend(
-        handles=legend_handles,
-        loc="upper left",
-        bbox_to_anchor=(1.02, 1.0),
-        borderaxespad=0.0,
-        frameon=False,
-        fontsize=14,
-    )
-
-    ax.set_aspect("equal", adjustable="box")
-
-    fig.tight_layout(rect=[0.0, 0.0, 0.8, 1.0])
-
-    base_name = "stuart_landau_lambda_gamma_r_regimes"
-    fig.savefig(f"{base_name}.png", transparent=True)
-
-    fig_a, ax_a = plt.subplots(figsize=(8.0, 6.0))
-    ax_a.imshow(
-        regime_plane_analytic,
-        origin="lower",
-        aspect="equal",
-        extent=[
-            lambda_values[0],
-            lambda_values[-1],
-            gamma_real_values[0],
-            gamma_real_values[-1],
+        handles=[
+            Patch(facecolor=thesis_blue, label="Stable fixed point"),
+            Patch(facecolor=ifisc_green, label="Stable limit cycle"),
+            Patch(facecolor=thesis_red, label="Divergent limit cycle"),
         ],
-        cmap=regime_cmap,
-        norm=norm,
+        loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0, frameon=False, fontsize=14,
     )
-    ax_a.set_xlabel(r"$\lambda$", fontsize=18)
-    ax_a.set_ylabel(r"$\gamma_\mathrm{r}$", fontsize=18)
-    ax_a.tick_params(labelsize=14)
-    ax_a.set_title(
-        r"Stuart--Landau analytical regimes in $(\lambda,\gamma_\mathrm{r})$",
-        fontsize=20,
-        pad=10,
+    ax.set_aspect("equal", adjustable="box")
+    fig.tight_layout(rect=[0.0, 0.0, 0.8, 1.0])
+    fig.savefig(path, transparent=True)
+    plt.close(fig)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Regime maps and bifurcation branches of a single Stuart-Landau node.")
+    parser.add_argument("--analytic-only", action="store_true",
+                        help="skip the slow numerical scan (the analytic map is Fig. 1)")
+    args = parser.parse_args()
+
+    omega = 1.0
+    gamma_imag = 0.0
+    lambda_values = np.linspace(-2.0, 2.0, 201)
+    gamma_real_values = np.linspace(-2.0, 2.0, 201)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    regime_plane_analytic, mean_amp_plane_analytic = compute_parameter_plane_2d_analytic(
+        lambda_values, gamma_real_values, z0_abs=0.1,
     )
-    ax_a.legend(
-        handles=legend_handles,
-        loc="upper left",
-        bbox_to_anchor=(1.02, 1.0),
-        borderaxespad=0.0,
-        frameon=False,
-        fontsize=14,
-    )
-    ax_a.set_aspect("equal", adjustable="box")
-    fig_a.tight_layout(rect=[0.0, 0.0, 0.8, 1.0])
-    analytic_base = "stuart_landau_lambda_gamma_r_regimes_analytic"
-    fig_a.savefig(f"{analytic_base}.png", transparent=True)
+    plot_regime_plane(regime_plane_analytic, lambda_values, gamma_real_values,
+                      os.path.join(OUTPUT_DIR, "stuart_landau_lambda_gamma_r_regimes_analytic.png"))
+
+    if not args.analytic_only:
+        regime_plane, mean_amp_plane = compute_parameter_plane_2d(
+            lambda_values, gamma_real_values, omega=omega, gamma_imag=gamma_imag,
+            dt=0.05, t_max=150.0, transient_fraction=0.5, diverging_threshold=5.0,
+        )
+        plot_regime_plane(regime_plane, lambda_values, gamma_real_values,
+                          os.path.join(OUTPUT_DIR, "stuart_landau_lambda_gamma_r_regimes.png"))
+        with open(os.path.join(OUTPUT_DIR, "stuart_landau_lambda_gamma_r_plane.json"), "w") as f:
+            json.dump({
+                "lambda_values": lambda_values.tolist(),
+                "gamma_real_values": gamma_real_values.tolist(),
+                "regime_plane": regime_plane.tolist(),
+                "mean_amplitude_plane": mean_amp_plane.tolist(),
+                "regime_plane_analytic": regime_plane_analytic.tolist(),
+                "mean_amplitude_plane_analytic": mean_amp_plane_analytic.tolist(),
+                "omega": float(omega),
+                "gamma_imag": float(gamma_imag),
+            }, f, indent=2)
 
     gamma_real_fixed = -1.0
     lambda_bif = np.linspace(-2.0, 2.0, 801)
@@ -392,7 +219,6 @@ def main():
 
     fig_bif, ax_bif = plt.subplots(figsize=(8.0, 5.0))
 
-    # ax_bif.axhline(0.0, color="black", linewidth=1.5)
     ax_bif.plot(
         lambda_bif[lambda_bif < 0.0],
         r_zero[lambda_bif < 0.0],
@@ -439,10 +265,9 @@ def main():
 
     fig_bif.tight_layout(rect=[0.0, 0.0, 0.8, 1.0])
 
-    bif_base = "stuart_landau_bifurcation_branches"
+    bif_base = os.path.join(OUTPUT_DIR, "stuart_landau_bifurcation_branches")
     fig_bif.savefig(f"{bif_base}.png", transparent=True)
 
-    plt.show()
 
 
 if __name__ == "__main__":

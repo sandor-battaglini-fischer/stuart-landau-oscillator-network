@@ -1,8 +1,4 @@
-"""Compute Jaeger short-term memory capacity for trained (or init) SLON/HORN models.
-
-Does not modify training. Loads a frozen checkpoint (or builds a fresh model),
-drives it with noise and/or task-like probes, fits a fresh linear readout from
-hidden states to delayed probe targets, and saves JSON + plots.
+"""Short-term memory capacity of a trained (or freshly initialised) model under noise and task probes.
 
 Examples:
   python analysis/memory_capacity.py --task smnist \\
@@ -55,10 +51,6 @@ PROBE_COLORS = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Run-dir / checkpoint helpers
-# ---------------------------------------------------------------------------
-
 def parse_run_log(log_path: str) -> dict:
     """Parse key: value lines from a training log into a flat dict."""
     params: dict = {}
@@ -73,7 +65,7 @@ def parse_run_log(log_path: str) -> dict:
             key = key.strip()
             value = value.strip()
             if key in params and key in ("omega", "lambda"):
-                # Prefer the resolved values written after the argparse dump.
+                # older Mackey-Glass logs repeat the resolved omega/lambda after the argument dump
                 params[key] = _parse_scalar(value)
                 continue
             if key not in params:
@@ -133,10 +125,8 @@ def merge_model_kwargs(args, log_params: dict | None) -> dict:
     src = log_params or {}
 
     def pick(cli_name, *log_keys, default=None):
+        # values from the run's log win over CLI values
         cli_val = getattr(args, cli_name, None)
-        # CLI defaults are always set; prefer log when --run-dir is used unless
-        # the user explicitly overrode via a non-default... We keep it simple:
-        # run-dir / log wins when present, else CLI.
         for key in log_keys:
             if key in src and src[key] is not None:
                 return src[key]
@@ -247,10 +237,6 @@ def build_model_for_task(task: str, kwargs: dict, state: dict | None = None):
     return model
 
 
-# ---------------------------------------------------------------------------
-# Task probes
-# ---------------------------------------------------------------------------
-
 def load_smnist_probe(num_steps: int, batch_size: int, seed: int, shuffle: bool = False):
     import torchvision
 
@@ -358,10 +344,6 @@ def load_imdb_probe(model, num_steps: int, batch_size: int, kwargs: dict, seed: 
     return embedded, target
 
 
-# ---------------------------------------------------------------------------
-# Plotting / IO
-# ---------------------------------------------------------------------------
-
 def resolve_output_dir(args) -> str:
     if args.output_dir:
         path = args.output_dir if os.path.isabs(args.output_dir) else os.path.join(PROJECT_ROOT, args.output_dir)
@@ -414,10 +396,6 @@ def parse_probes(raw: str) -> list[str]:
         raise ValueError("Provide at least one probe via --probes")
     return probes
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def run(args):
     probes = parse_probes(args.probes)

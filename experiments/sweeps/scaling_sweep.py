@@ -18,6 +18,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
@@ -27,9 +28,13 @@ from experiments.sweeps.sweep_common import (
     aggregate_epoch_curves,
     aggregate_scalar_results,
     cmd_with_overrides,
+    default_mackey_glass_horizon,
     horizon_color_scale,
     load_results,
     load_sweep_config,
+    mackey_glass_horizons,
+    multi_task_panels,
+    other_tasks_have_data,
     observed_horizons,
     plot_epoch_curves_with_stats,
     resolve_plot_horizons,
@@ -42,6 +47,7 @@ from experiments.sweeps.sweep_common import (
     save_csv,
     save_results,
     save_summary,
+    task_panel_title,
 )
 from utils.plotting_utils.style import mycmap
 
@@ -376,7 +382,7 @@ def report_scaling_progress(
             if len(named) == 1:
                 prefix = f"{prefix}H={named[0]} "
             elif not named:
-                h = default_mackey_glass_horizon()
+                h = default_mackey_glass_horizon(TASKS)
                 if h is not None:
                     prefix = f"{prefix}H={h} "
         for n in ns:
@@ -389,9 +395,7 @@ def update_live_plots(
     results: dict, sweep_dir: Path, horizons: list[int] | None = None
 ) -> None:
     plot_summary(results, sweep_dir / "scaling_performance.png", horizons=horizons)
-    if mackey_glass_horizons(results) and not other_tasks_have_data(results):
-        return
-    plot_epoch_results(results, sweep_dir)
+    plot_epoch_results(results, sweep_dir, horizons=horizons)
 
 
 def run_jobs_parallel(
@@ -447,50 +451,6 @@ def run_jobs_parallel(
             update_live_plots(results, sweep_dir)
 
     return results
-
-
-def mackey_glass_horizons(results: dict) -> list[int]:
-    horizons = {
-        int(entry[HORIZON_KEY])
-        for entry in results.get("mackey_glass", [])
-        if entry.get("status") == "ok" and entry.get(HORIZON_KEY) is not None
-    }
-    return sorted(horizons)
-
-
-def default_mackey_glass_horizon() -> int | None:
-    cmd = TASKS["mackey_glass"].base_cmd
-    try:
-        return int(cmd[cmd.index("--horizon") + 1])
-    except (ValueError, IndexError):
-        return None
-
-
-def mackey_glass_display_horizon(results: dict) -> int | None:
-    hs = mackey_glass_horizons(results)
-    if len(hs) == 1:
-        return hs[0]
-    if not hs:
-        return default_mackey_glass_horizon()
-    return None
-
-
-def task_panel_title(task_key: str, task: TaskConfig, results: dict) -> str:
-    if task_key != "mackey_glass":
-        return task.name
-    h = mackey_glass_display_horizon(results)
-    if h is None:
-        return task.name
-    return rf"{task.name} $H={h}$"
-
-
-def other_tasks_have_data(results: dict) -> bool:
-    for task_key in TASKS:
-        if task_key == "mackey_glass":
-            continue
-        if any(entry.get("status") == "ok" for entry in results.get(task_key, [])):
-            return True
-    return False
 
 
 def plot_horizon_scaling_performance(
@@ -550,7 +510,7 @@ def plot_horizon_scaling_performance(
 def plot_summary(
     results: dict, plot_path: Path, horizons: list[int] | None = None
 ) -> None:
-    if mackey_glass_horizons(results) and not other_tasks_have_data(results):
+    if mackey_glass_horizons(results) and not other_tasks_have_data(results, TASKS):
         plot_horizon_scaling_performance(results, plot_path, horizons=horizons)
         return
 
@@ -568,7 +528,7 @@ def plot_summary(
             "black",
             task.metric_label,
             ylim=task.ylim,
-            title=f"({chr(ord('a') + i)}) {task_panel_title(task_key, task, results)}",
+            title=f"({chr(ord('a') + i)}) {task_panel_title(task_key, task, results, TASKS)}",
         )
         ax.set_xscale("log")
 
@@ -581,24 +541,20 @@ def plot_summary(
     print(f"Saved plot: {plot_path}")
 
 
-def plot_epoch_results(results: dict, plot_dir: Path) -> None:
+def plot_epoch_results(results: dict, plot_dir: Path, horizons: list[int] | None = None) -> None:
     plot_dir.mkdir(parents=True, exist_ok=True)
-    n_tasks = len(TASKS)
-    fig, axes = plt.subplots(n_tasks, 1, figsize=(7, 3.2 * n_tasks), sharex=True)
-    if n_tasks == 1:
-        axes = [axes]
+    panels = multi_task_panels(results, TASKS, horizons=horizons)
+    fig, axes = plt.subplots(len(panels), 1, figsize=(7, 3.2 * len(panels)), sharex=True)
+    axes = np.atleast_1d(axes)
     has_data = False
 
-    for i, (ax, (task_key, task)) in enumerate(zip(axes, TASKS.items())):
-        ax.set_title(
-            f"({chr(ord('a') + i)}) {task_panel_title(task_key, task, results)}",
-            loc="left",
-        )
+    for i, (ax, (task_key, task, title, entries)) in enumerate(zip(axes, panels)):
+        ax.set_title(f"({chr(ord('a') + i)}) {title}", loc="left")
         ax.set_ylabel(task.epoch_ylabel)
         ax.set_ylim(*task.ylim)
         ax.grid(True, alpha=0.3)
 
-        curves = aggregate_epoch_curves(results.get(task_key, []), GROUP_KEY)
+        curves = aggregate_epoch_curves(entries, GROUP_KEY)
         if not curves:
             continue
 

@@ -1,5 +1,3 @@
-# SL-RNN (Stuart-Landau Recurreent Neural Network) module
-
 import math
 import torch
 
@@ -101,7 +99,7 @@ class SLON(torch.nn.Module):
         
         return torch.real(z), torch.imag(z)
 
-    def forward(self, batch, random_init = None, record = False):
+    def forward(self, batch, random_init=None, record=False):
         batch_size = batch.size(1)
         num_timesteps = batch.size(0)
         device = batch.device
@@ -119,7 +117,7 @@ class SLON(torch.nn.Module):
             ret['rec_z_real'] = rec_z_real
             ret['rec_z_imag'] = rec_z_imag
 
-        if not random_init is None:
+        if random_init is not None:
             z_real = torch.randn(batch_size, self.num_nodes, device=device, dtype=dtype) * random_init
             z_imag = torch.randn(batch_size, self.num_nodes, device=device, dtype=dtype) * random_init
         else:

@@ -1,3 +1,5 @@
+import os
+
 import matplotlib.pyplot as plt
 import numpy as np
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
@@ -121,10 +123,6 @@ for lam, gr, r0, anchor in cases:
     inax.axvline(0, color='0.7', lw=0.45)
 
 fig.subplots_adjust(left=0.11, right=0.97, top=0.90, bottom=0.10)
-import os
-save_path = 'results/dynamics/regime_diagram_state_space.png'
-save_dir = os.path.dirname(save_path)
-if not os.path.exists(save_dir):
-    os.makedirs(save_dir, exist_ok=True)
+save_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'results', 'dynamics', 'regime_diagram_state_space.png')
+os.makedirs(os.path.dirname(save_path), exist_ok=True)
 fig.savefig(save_path, dpi=400)
-plt.show()
